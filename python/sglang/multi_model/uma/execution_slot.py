@@ -110,6 +110,7 @@ class UMAExecutionSlot:
     def __init__(self) -> None:
         self._runtimes: dict[str, BoundModelRuntime] = {}
         self._active_instance_id: str | None = None
+        self._active_weight_lease: Any | None = None
         self._in_flight_count = 0
         self._accepting_forwards = True
         self._lock = threading.RLock()
@@ -158,6 +159,39 @@ class UMAExecutionSlot:
                 raise RuntimeBindError("cannot unregister the active runtime")
             self._runtimes.pop(instance_id, None)
 
+    @staticmethod
+    def _acquire_weight_lease(runtime: BoundModelRuntime) -> Any | None:
+        """Validate and pin a complete runtime for its whole bound lifetime."""
+
+        runtime.validate_complete()
+        if not runtime.required_weight_groups:
+            return None
+        weight_runtime = runtime.execution_resources.weight_runtime
+        observed = weight_runtime.readiness(runtime.instance_id)
+        missing = runtime.required_weight_groups - observed
+        if missing:
+            raise IncompleteRuntimeError(
+                f"runtime lost ready weight groups: {sorted(missing)}"
+            )
+        return weight_runtime.pin(
+            sorted(runtime.required_weight_groups),
+            f"active:{runtime.instance_id}:{runtime.resource_epoch}",
+            instance_id=runtime.instance_id,
+        )
+
+    def _release_active_weight_lease(self) -> None:
+        lease = self._active_weight_lease
+        if lease is None:
+            return
+        try:
+            lease.release()
+        except BaseException:
+            if not getattr(lease, "active", True):
+                self._active_weight_lease = None
+            raise
+        else:
+            self._active_weight_lease = None
+
     def bind(
         self,
         instance_id: str,
@@ -200,9 +234,14 @@ class UMAExecutionSlot:
                     resource_epoch,
                     f"{self._in_flight_count} forward(s) in flight",
                 )
+            old_runtime = (
+                self._runtimes.get(self._active_instance_id)
+                if self._active_instance_id is not None
+                else None
+            )
+            old_lease = self._active_weight_lease
             try:
-                runtime.validate_complete()
-                binder(runtime)
+                target_lease = self._acquire_weight_lease(runtime)
             except Exception as exc:
                 return RuntimeBindResult(
                     UMAControlCode.MODEL_BIND_FAILURE,
@@ -211,7 +250,56 @@ class UMAExecutionSlot:
                     resource_epoch,
                     str(exc),
                 )
+            try:
+                binder(runtime)
+            except Exception as exc:
+                if target_lease is not None:
+                    target_lease.release()
+                return RuntimeBindResult(
+                    UMAControlCode.MODEL_BIND_FAILURE,
+                    instance_id,
+                    placement_version,
+                    resource_epoch,
+                    str(exc),
+                )
+            try:
+                if old_lease is not None:
+                    old_lease.release()
+            except Exception as exc:
+                rollback_errors = []
+                if old_runtime is not None:
+                    try:
+                        binder(old_runtime)
+                    except Exception as rollback_exc:
+                        rollback_errors.append(f"runner rollback: {rollback_exc}")
+                if target_lease is not None:
+                    try:
+                        target_lease.release()
+                    except Exception as rollback_exc:
+                        rollback_errors.append(
+                            f"target lease rollback: {rollback_exc}"
+                        )
+                if old_runtime is not None and not getattr(old_lease, "active", True):
+                    try:
+                        old_lease = self._acquire_weight_lease(old_runtime)
+                    except Exception as rollback_exc:
+                        rollback_errors.append(
+                            f"old lease reacquire: {rollback_exc}"
+                        )
+                        old_lease = None
+                self._active_weight_lease = old_lease
+                detail = f"active lease release failed: {exc}"
+                if rollback_errors:
+                    detail += "; " + "; ".join(rollback_errors)
+                return RuntimeBindResult(
+                    UMAControlCode.MODEL_BIND_FAILURE,
+                    instance_id,
+                    placement_version,
+                    resource_epoch,
+                    detail,
+                )
             self._active_instance_id = instance_id
+            self._active_weight_lease = target_lease
             self._accepting_forwards = True
             return RuntimeBindResult(
                 UMAControlCode.OK,
@@ -229,6 +317,7 @@ class UMAExecutionSlot:
                     (f"{self._in_flight_count} worker forward(s) in flight",),
                     self._in_flight_count,
                 )
+            self._release_active_weight_lease()
             return SafePointResult(UMAControlCode.OK)
 
     def unbind(self, instance_id: str) -> SafePointResult:
@@ -248,6 +337,7 @@ class UMAExecutionSlot:
                         f"not {instance_id}",
                     ),
                 )
+            self._release_active_weight_lease()
             self._active_instance_id = None
             return SafePointResult(UMAControlCode.OK)
 
@@ -255,6 +345,9 @@ class UMAExecutionSlot:
         with self._lock:
             if self._active_instance_id is None:
                 raise RuntimeBindError("cannot resume without an active runtime")
+            if self._active_weight_lease is None:
+                runtime = self._runtimes[self._active_instance_id]
+                self._active_weight_lease = self._acquire_weight_lease(runtime)
             self._accepting_forwards = True
 
     @contextmanager
@@ -263,7 +356,6 @@ class UMAExecutionSlot:
         *,
         owner: str = "forward",
     ) -> Iterator[BoundModelRuntime | None]:
-        weight_lease = None
         with self._lock:
             if not self._accepting_forwards:
                 raise RuntimeBindError("execution slot is quiesced")
@@ -272,35 +364,12 @@ class UMAExecutionSlot:
                 if self._active_instance_id is not None
                 else None
             )
-            if runtime is not None:
-                runtime.validate_complete()
             self._in_flight_count += 1
-            try:
-                if runtime is not None and runtime.required_weight_groups:
-                    weight_runtime = runtime.execution_resources.weight_runtime
-                    observed = weight_runtime.readiness(runtime.instance_id)
-                    missing = runtime.required_weight_groups - observed
-                    if missing:
-                        raise IncompleteRuntimeError(
-                            f"runtime lost ready weight groups: {sorted(missing)}"
-                        )
-                    weight_lease = weight_runtime.pin(
-                        sorted(runtime.required_weight_groups),
-                        owner,
-                        instance_id=runtime.instance_id,
-                    )
-            except BaseException:
-                self._in_flight_count -= 1
-                raise
         try:
             yield runtime
         finally:
-            try:
-                if weight_lease is not None:
-                    weight_lease.release()
-            finally:
-                with self._lock:
-                    self._in_flight_count -= 1
-                    if self._in_flight_count < 0:
-                        self._in_flight_count = 0
-                        raise RuntimeError("execution-slot forward count underflow")
+            with self._lock:
+                self._in_flight_count -= 1
+                if self._in_flight_count < 0:
+                    self._in_flight_count = 0
+                    raise RuntimeError("execution-slot forward count underflow")

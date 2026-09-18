@@ -59,20 +59,27 @@ class Module:
     def __init__(self) -> None:
         self.logits_processor = object()
         self.runtime_buffers = []
+        self.named_buffers_calls = 0
 
     def forward(self, input_ids, positions, forward_batch):
         return input_ids
 
     def named_buffers(self):
+        self.named_buffers_calls += 1
         return tuple(self.runtime_buffers)
 
 
 class WeightLease:
     def __init__(self, runtime) -> None:
         self.runtime = runtime
+        self.active = True
 
     def release(self) -> None:
+        if not self.active:
+            return
+        self.active = False
         self.runtime.pins -= 1
+        self.runtime.release_calls += 1
         if self.runtime.fail_release:
             raise RuntimeError("injected lease release failure")
 
@@ -87,13 +94,18 @@ class WeightRuntime:
         self.ready = ready
         self.pins = 0
         self.fail_release = fail_release
+        self.readiness_calls = 0
+        self.pin_calls = 0
+        self.release_calls = 0
 
     def readiness(self, instance_id):
         assert instance_id
+        self.readiness_calls += 1
         return self.ready
 
     def pin(self, groups, owner, *, instance_id):
         assert groups and owner and instance_id
+        self.pin_calls += 1
         self.pins += 1
         return WeightLease(self)
 
@@ -220,7 +232,7 @@ def test_bind_is_deferred_while_forward_lease_is_active():
     assert slot.active_instance_id == candidate.instance_id
 
 
-def test_forward_revalidates_and_pins_managed_weight_groups():
+def test_bind_holds_one_weight_lease_until_quiesce_and_resume():
     weights = WeightRuntime()
     slot = UMAExecutionSlot()
     candidate = runtime(weight_runtime=weights)
@@ -231,22 +243,57 @@ def test_forward_revalidates_and_pins_managed_weight_groups():
         resource_epoch=7,
         binder=lambda _: None,
     ).accepted
+    assert weights.pins == 1
+    assert weights.readiness_calls == 1
+    assert weights.pin_calls == 1
+
+    candidate.module.named_buffers_calls = 0
 
     with slot.forward_lease(owner="batch-1"):
         assert weights.pins == 1
-    assert weights.pins == 0
+    assert weights.pins == 1
+    assert weights.readiness_calls == 1
+    assert weights.pin_calls == 1
+    assert candidate.module.named_buffers_calls == 0
 
-    weights.ready = frozenset()
-    with pytest.raises(execution_slot.IncompleteRuntimeError, match="lost ready"):
-        with slot.forward_lease(owner="batch-2"):
-            pytest.fail("forward entered with evicted weights")
-    assert slot.in_flight_count == 0
+    assert slot.quiesce().accepted
+    assert weights.pins == 0
+    assert weights.release_calls == 1
+
+    slot.resume()
+    assert weights.pins == 1
+    assert weights.readiness_calls == 2
+    assert weights.pin_calls == 2
+
+    assert slot.unbind(candidate.instance_id).accepted
+    assert weights.pins == 0
+    assert weights.release_calls == 2
+
+
+def test_bind_rejects_weight_runtime_that_lost_ready_groups():
+    weights = WeightRuntime(ready=frozenset())
+    slot = UMAExecutionSlot()
+    candidate = runtime(weight_runtime=weights)
+    slot.register(candidate)
+
+    result = slot.bind(
+        candidate.instance_id,
+        placement_version=3,
+        resource_epoch=7,
+        binder=lambda _: pytest.fail("incomplete runtime reached binder"),
+    )
+
+    assert result.code is UMAControlCode.MODEL_BIND_FAILURE
+    assert "lost ready" in result.reason
+    assert weights.pins == 0
 
 
 def test_failed_binder_does_not_publish_new_active_instance():
     slot = UMAExecutionSlot()
-    old = runtime("model-a")
-    new = runtime("model-b")
+    old_weights = WeightRuntime()
+    new_weights = WeightRuntime()
+    old = runtime("model-a", weight_runtime=old_weights)
+    new = runtime("model-b", weight_runtime=new_weights)
     slot.register(old)
     slot.register(new)
     assert slot.bind(
@@ -269,6 +316,8 @@ def test_failed_binder_does_not_publish_new_active_instance():
     assert result.code is UMAControlCode.MODEL_BIND_FAILURE
     assert "injected runner bind failure" in result.reason
     assert slot.active_instance_id == "model-a"
+    assert old_weights.pins == 1
+    assert new_weights.pins == 0
 
 
 def test_active_runtime_cannot_be_replaced_without_a_bind_transaction():
@@ -298,9 +347,12 @@ def test_failed_weight_lease_release_still_retires_forward_count():
         binder=lambda _: None,
     ).accepted
 
+    with slot.forward_lease(owner="batch-1"):
+        pass
+    assert slot.in_flight_count == 0
+
     with pytest.raises(RuntimeError, match="lease release failure"):
-        with slot.forward_lease(owner="batch-1"):
-            pass
+        slot.quiesce()
     assert slot.in_flight_count == 0
 
 

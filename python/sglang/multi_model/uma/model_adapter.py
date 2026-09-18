@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+import threading
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from sglang.multi_model.uma.weight_plan import (
@@ -15,6 +16,156 @@ from sglang.multi_model.uma.weight_plan import (
 
 
 _METADATA_MODEL_BUILD = ContextVar("metadata_model_build", default=False)
+
+_ROPE_CACHE_ATTRIBUTES = (
+    "head_size",
+    "rotary_dim",
+    "max_position_embeddings",
+    "base",
+    "is_neox_style",
+    "dtype",
+    "scaling_factor",
+    "original_max_position_embeddings",
+    "extrapolation_factor",
+    "attn_factor",
+    "beta_fast",
+    "beta_slow",
+    "alpha",
+    "short_factor",
+    "long_factor",
+    "short_mscale",
+    "long_mscale",
+    "mscale",
+    "mscale_all_dim",
+    "mrope_section",
+)
+
+
+def _freeze_runtime_buffer_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_runtime_buffer_value(item) for item in value)
+    if isinstance(value, Mapping):
+        return tuple(
+            sorted(
+                (str(key), _freeze_runtime_buffer_value(item))
+                for key, item in value.items()
+            )
+        )
+    return str(value)
+
+
+class RuntimeBufferCache:
+    """Own immutable constructor-generated buffers across model activations."""
+
+    def __init__(self) -> None:
+        self._buffers: dict[tuple[Any, ...], Any] = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _key(owner: Any, buffer_name: str, buffer: Any, device: Any) -> tuple:
+        missing = [
+            name
+            for name in (
+                "head_size",
+                "rotary_dim",
+                "max_position_embeddings",
+                "base",
+                "is_neox_style",
+                "dtype",
+            )
+            if not hasattr(owner, name)
+        ]
+        if missing:
+            raise ValueError(
+                "RoPE runtime buffer has incomplete cache semantics: "
+                f"{missing}"
+            )
+        semantics = tuple(
+            (name, _freeze_runtime_buffer_value(getattr(owner, name)))
+            for name in _ROPE_CACHE_ATTRIBUTES
+            if hasattr(owner, name)
+        )
+        # A cache belongs to one ModelRunner/device.  Normalize away an
+        # optional CUDA index so a bootstrap tensor reported as ``cuda:0``
+        # matches a metadata activation requested through ``torch.device(
+        # "cuda")`` in that same runner.
+        device_type = getattr(device, "type", None) or str(device).split(":", 1)[0]
+        return (
+            type(owner).__module__,
+            type(owner).__qualname__,
+            buffer_name,
+            tuple(buffer.shape),
+            str(buffer.dtype),
+            str(device_type),
+            semantics,
+        )
+
+    def resolve(
+        self,
+        owner: Any,
+        buffer_name: str,
+        meta_buffer: Any,
+        builder: Any,
+        device: Any,
+    ) -> Any:
+        """Return cached storage or build it once for a new RoPE signature."""
+
+        import torch
+
+        key = self._key(owner, buffer_name, meta_buffer, device)
+        with self._lock:
+            cached = self._buffers.get(key)
+            if cached is not None:
+                return cached
+            with torch.device(device):
+                replacement = builder()
+            replacement = replacement.to(device=device, dtype=meta_buffer.dtype)
+            if replacement.device.type == "meta":
+                raise RuntimeError("runtime buffer builder returned a meta tensor")
+            self._buffers[key] = replacement
+            return replacement
+
+    def adopt(
+        self,
+        owner: Any,
+        buffer_name: str,
+        buffer: Any,
+    ) -> Any:
+        """Seed the cache from an ordinary SGLang bootstrap runtime."""
+
+        if buffer.device.type == "meta":
+            raise ValueError("cannot adopt a meta runtime buffer")
+        key = self._key(owner, buffer_name, buffer, buffer.device)
+        with self._lock:
+            return self._buffers.setdefault(key, buffer)
+
+    def adopt_module(self, module: Any) -> int:
+        for _, owner in module.named_modules():
+            for buffer_name, buffer in tuple(owner._buffers.items()):
+                if (
+                    buffer is None
+                    or buffer.device.type == "meta"
+                    or buffer_name != "cos_sin_cache"
+                    or not callable(getattr(owner, "_compute_cos_sin_cache", None))
+                ):
+                    continue
+                owner._buffers[buffer_name] = self.adopt(
+                    owner,
+                    buffer_name,
+                    buffer,
+                )
+        return ModelAdapter.runtime_buffer_storage_bytes(module)
+
+    @property
+    def resident_bytes(self) -> int:
+        with self._lock:
+            unique = {id(buffer): buffer for buffer in self._buffers.values()}
+            return sum(
+                buffer.numel() * buffer.element_size()
+                for buffer in unique.values()
+            )
 
 
 @contextmanager
@@ -194,7 +345,13 @@ class ModelAdapter(ABC):
             )
         return module
 
-    def materialize_runtime_buffers(self, module: Any, device: Any) -> int:
+    def materialize_runtime_buffers(
+        self,
+        module: Any,
+        device: Any,
+        *,
+        cache: RuntimeBufferCache | None = None,
+    ) -> int:
         """Materialize non-checkpoint state created by model constructors.
 
         A metadata model puts both parameters and buffers on the meta device.
@@ -207,8 +364,7 @@ class ModelAdapter(ABC):
         Llama and Mistral rotary modules.  An unfamiliar meta buffer fails
         registration loudly instead of surviving until the first forward.
         """
-        import torch
-
+        buffer_cache = cache or RuntimeBufferCache()
         materialized: dict[int, Any] = {}
         unsupported: list[str] = []
         for module_name, owner in module.named_modules():
@@ -223,11 +379,12 @@ class ModelAdapter(ABC):
                     unsupported.append(qualified_name)
                     continue
                 try:
-                    with torch.device(device):
-                        replacement = builder()
-                    replacement = replacement.to(
-                        device=device,
-                        dtype=buffer.dtype,
+                    replacement = buffer_cache.resolve(
+                        owner,
+                        buffer_name,
+                        buffer,
+                        builder,
+                        device,
                     )
                 except TypeError as exc:
                     raise RuntimeError(

@@ -35,6 +35,7 @@ from sglang.multi_model.uma.execution_slot import (
 from sglang.multi_model.uma.model_adapter import (
     BoundModelRuntime,
     ExecutionResourceBundle,
+    RuntimeBufferCache,
     default_adapter_registry,
 )
 from sglang.multi_model.uma.runtime_registry import (
@@ -275,6 +276,7 @@ class ModelRunner:
         self._uma_managed_runtimes = ManagedRuntimeRegistry()
         self._uma_weight_reader = SafetensorsExtentReader()
         self._uma_weight_leases = LocalLeaseTable()
+        self._uma_runtime_buffer_cache = RuntimeBufferCache()
 
     @property
     def uma_in_flight_count(self) -> int:
@@ -510,12 +512,13 @@ class ModelRunner:
                     group,
                 )
             resources = self._capture_uma_execution_resources(weight_runtime)
-            runtime_buffer_bytes = adapter.runtime_buffer_storage_bytes(module)
+            runtime_buffer_bytes = self._uma_runtime_buffer_cache.adopt_module(module)
         else:
             module = adapter.build_meta_module()
             runtime_buffer_bytes = adapter.materialize_runtime_buffers(
                 module,
                 torch.device(self.device),
+                cache=self._uma_runtime_buffer_cache,
             )
             resources = self._build_uma_execution_resources(
                 model_config,
@@ -1923,22 +1926,42 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+        # Preserve the original SGLang hot path until an UMA runtime is
+        # explicitly bound.  The scheduler safe-point contract prevents a
+        # first bind from racing an ordinary in-flight request.
+        if self.active_instance_id is None:
+            return self._forward_with_runtime_hooks(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+            )
         with self._uma_execution_slot.forward_lease(
             owner=f"forward:{self.forward_pass_id + 1}:{id(forward_batch)}"
         ):
-            self.forward_pass_id += 1
-
-            with get_global_expert_distribution_recorder().with_forward_pass(
-                self.forward_pass_id,
+            return self._forward_with_runtime_hooks(
                 forward_batch,
-            ):
-                output = self._forward_raw(
-                    forward_batch, skip_attn_backend_init, pp_proxy_tensors
-                )
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+            )
 
-            if self.eplb_manager is not None:
-                self.eplb_manager.on_forward_pass_end()
+    def _forward_with_runtime_hooks(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+        self.forward_pass_id += 1
 
+        with get_global_expert_distribution_recorder().with_forward_pass(
+            self.forward_pass_id,
+            forward_batch,
+        ):
+            output = self._forward_raw(
+                forward_batch, skip_attn_backend_init, pp_proxy_tensors
+            )
+
+        if self.eplb_manager is not None:
+            self.eplb_manager.on_forward_pass_end()
         return output
 
     def _forward_raw(

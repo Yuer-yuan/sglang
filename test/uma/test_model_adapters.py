@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
+from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -78,6 +79,7 @@ TensorExtent = weight_plan.TensorExtent
 WeightKind = weight_plan.WeightKind
 build_weight_plan = weight_plan.build_weight_plan
 ModelAdapterRegistry = model_adapter.ModelAdapterRegistry
+RuntimeBufferCache = model_adapter.RuntimeBufferCache
 Qwen3Adapter = qwen3.Qwen3Adapter
 LlamaFamilyAdapter = llama_family.LlamaFamilyAdapter
 
@@ -250,3 +252,127 @@ def test_untied_embedding_and_head_are_independently_owned():
         WeightKind.FINAL_NORM,
         WeightKind.LM_HEAD,
     ]
+
+
+def test_runtime_buffer_cache_reuses_equal_rope_storage(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(device=lambda _: nullcontext()),
+    )
+
+    class FakeBuffer:
+        shape = (128, 64)
+        dtype = "float32"
+
+        def __init__(self, device_type: str) -> None:
+            self.device = SimpleNamespace(type=device_type)
+
+        def to(self, *, device, dtype):
+            assert dtype == self.dtype
+            return FakeBuffer(str(device))
+
+        def numel(self):
+            return 128 * 64
+
+        def element_size(self):
+            return 4
+
+    class FakeRotary:
+        def __init__(self, *, base: int = 10_000) -> None:
+            self.head_size = 64
+            self.rotary_dim = 64
+            self.max_position_embeddings = 128
+            self.base = base
+            self.is_neox_style = True
+            self.dtype = "float32"
+            self.build_count = 0
+            self.cos_sin_cache = FakeBuffer("meta")
+
+        def _compute_cos_sin_cache(self):
+            self.build_count += 1
+            return FakeBuffer("cpu")
+
+    cache = RuntimeBufferCache()
+    first = FakeRotary()
+    second = FakeRotary()
+
+    first_value = cache.resolve(
+        first,
+        "cos_sin_cache",
+        first.cos_sin_cache,
+        first._compute_cos_sin_cache,
+        "cpu",
+    )
+    second_value = cache.resolve(
+        second,
+        "cos_sin_cache",
+        second.cos_sin_cache,
+        second._compute_cos_sin_cache,
+        "cpu",
+    )
+
+    assert first_value is second_value
+    assert first.build_count == 1
+    assert second.build_count == 0
+    assert cache.resident_bytes == first_value.numel() * first_value.element_size()
+
+
+def test_runtime_buffer_cache_does_not_alias_different_rope_semantics(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(device=lambda _: nullcontext()),
+    )
+
+    class FakeBuffer:
+        shape = (128, 64)
+        dtype = "float32"
+
+        def __init__(self, device_type: str) -> None:
+            self.device = SimpleNamespace(type=device_type)
+
+        def to(self, *, device, dtype):
+            assert dtype == self.dtype
+            return FakeBuffer(str(device))
+
+        def numel(self):
+            return 128 * 64
+
+        def element_size(self):
+            return 4
+
+    class FakeRotary:
+        def __init__(self, base: int) -> None:
+            self.head_size = 64
+            self.rotary_dim = 64
+            self.max_position_embeddings = 128
+            self.base = base
+            self.is_neox_style = True
+            self.dtype = "float32"
+            self.cos_sin_cache = FakeBuffer("meta")
+
+        def _compute_cos_sin_cache(self):
+            return FakeBuffer("cpu")
+
+    cache = RuntimeBufferCache()
+    first = FakeRotary(10_000)
+    second = FakeRotary(1_000_000)
+
+    first_value = cache.resolve(
+        first,
+        "cos_sin_cache",
+        first.cos_sin_cache,
+        first._compute_cos_sin_cache,
+        "cpu",
+    )
+    second_value = cache.resolve(
+        second,
+        "cos_sin_cache",
+        second.cos_sin_cache,
+        second._compute_cos_sin_cache,
+        "cpu",
+    )
+
+    assert first_value is not second_value
+    assert cache.resident_bytes == 2 * first_value.numel() * first_value.element_size()
