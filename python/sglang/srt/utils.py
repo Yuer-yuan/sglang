@@ -1371,6 +1371,20 @@ def get_device_sm():
 
 
 def get_nvgpu_memory_capacity():
+    def get_torch_cuda_memory_capacity():
+        """Return the smallest CUDA device capacity in MiB.
+
+        Jetson exposes CUDA unified memory through the runtime but does not
+        implement the desktop ``nvidia-smi --query-gpu`` interface.
+        """
+        memory_values = [
+            torch.cuda.get_device_properties(i).total_memory / (1024 * 1024)
+            for i in range(torch.cuda.device_count())
+        ]
+        if not memory_values:
+            raise ValueError("No CUDA device memory values found.")
+        return min(memory_values)
+
     try:
         # Run nvidia-smi and capture the output
         result = subprocess.run(
@@ -1381,7 +1395,7 @@ def get_nvgpu_memory_capacity():
         )
 
         if result.returncode != 0:
-            raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
+            return get_torch_cuda_memory_capacity()
 
         # Parse the output to extract memory values
         memory_values = [
@@ -1391,15 +1405,13 @@ def get_nvgpu_memory_capacity():
         ]
 
         if not memory_values:
-            raise ValueError("No GPU memory values found.")
+            return get_torch_cuda_memory_capacity()
 
         # Return the minimum memory value
         return min(memory_values)
 
     except FileNotFoundError:
-        raise RuntimeError(
-            "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
-        )
+        return get_torch_cuda_memory_capacity()
 
 
 def get_hpu_memory_capacity():

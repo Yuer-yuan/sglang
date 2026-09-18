@@ -831,6 +831,25 @@ class Scheduler(
                 self.last_batch = last_mbs[mb_id]
 
                 recv_reqs = self.recv_requests()
+                # Weight replacement is a PP-wide control operation.  Forward
+                # it before doing any local I/O so every stage can load in
+                # parallel and rendezvous before the new version is visible.
+                early_forward_update = any(
+                    isinstance(req, UpdateWeightFromDiskReqInput)
+                    for req in recv_reqs
+                )
+                if (
+                    early_forward_update
+                    and self.attn_tp_rank == 0
+                    and not self.pp_group.is_last_rank
+                ):
+                    dp_offset = self.attn_dp_rank * self.attn_tp_size
+                    point_to_point_pyobj(
+                        recv_reqs, self.pp_rank * self.tp_size + dp_offset,
+                        self.world_group.device_group,
+                        self.pp_rank * self.tp_size + dp_offset,
+                        (self.pp_rank + 1) * self.tp_size + dp_offset,
+                    )
                 self.process_input_requests(recv_reqs)
                 mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
@@ -924,7 +943,7 @@ class Scheduler(
 
                     # send out reqs to the next stage
                     dp_offset = self.attn_dp_rank * self.attn_tp_size
-                    if self.attn_tp_rank == 0:
+                    if self.attn_tp_rank == 0 and not early_forward_update:
                         point_to_point_pyobj(
                             recv_reqs,
                             self.pp_rank * self.tp_size + dp_offset,
@@ -2256,13 +2275,29 @@ class Scheduler(
         raise NotImplementedError()
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        """In-place update of the weights from disk."""
+        """In-place, version-atomic PP update of the weights from disk."""
+        if self.pp_group.world_size > 1:
+            self.pp_group.barrier()
+
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:
             flush_cache_success = self.flush_cache()
             assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
+
+        if self.pp_group.world_size > 1:
+            stage_results = [None] * self.pp_group.world_size
+            torch.distributed.all_gather_object(
+                stage_results,
+                (success, message),
+                group=self.pp_group.cpu_group,
+            )
+            success = all(result[0] for result in stage_results)
+            message = " | ".join(
+                f"pp{rank}: {result[1]}"
+                for rank, result in enumerate(stage_results)
+            )
         return UpdateWeightFromDiskReqOutput(success, message, 0)
 
     def load_lora_adapter(
