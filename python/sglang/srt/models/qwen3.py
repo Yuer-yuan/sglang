@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.multi_model.uma.model_adapter import is_metadata_model_build
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -249,7 +250,11 @@ class Qwen3Model(Qwen2Model):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = (
+            torch.cuda.Stream()
+            if _is_cuda and not is_metadata_model_build()
+            else None
+        )
         super().__init__(
             config=config,
             quant_config=quant_config,
