@@ -77,6 +77,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GenerateReqInput,
+    GetUMAWeightSnapshotReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -84,6 +85,8 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    EvictWeightGroupReq,
+    LoadWeightGroupReq,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateResult,
@@ -93,6 +96,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqOutput,
     ProfileReqType,
     QuiesceInstanceReq,
+    RegisterModelAdapterReq,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -105,6 +109,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UMAControlReqOutput,
+    UMAWeightReqOutput,
+    UnbindInstanceReq,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -349,6 +355,9 @@ class TokenizerManager:
         self.uma_control_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.uma_weight_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -422,6 +431,10 @@ class TokenizerManager:
                 (
                     UMAControlReqOutput,
                     self.uma_control_communicator.handle_recv,
+                ),
+                (
+                    UMAWeightReqOutput,
+                    self.uma_weight_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -991,15 +1004,55 @@ class TokenizerManager:
 
         return await self._send_uma_control(obj)
 
+    async def unbind_uma_instance(
+        self,
+        obj: UnbindInstanceReq,
+    ) -> UMAControlReqOutput:
+        """Detach the quiesced runtime while retaining its resident resources."""
+
+        return await self._send_uma_control(obj)
+
     async def _send_uma_control(
         self,
-        obj: Union[BindInstanceReq, QuiesceInstanceReq],
+        obj: Union[BindInstanceReq, QuiesceInstanceReq, UnbindInstanceReq],
     ) -> UMAControlReqOutput:
         self.auto_create_handle_loop()
         async with self.model_update_lock.writer_lock:
             results = await self.uma_control_communicator(obj)
         if not results:
             raise RuntimeError("UMA control request returned no scheduler result")
+        failures = [result for result in results if not result.success]
+        return failures[0] if failures else results[0]
+
+    async def register_uma_model(
+        self,
+        obj: RegisterModelAdapterReq,
+    ) -> UMAWeightReqOutput:
+        return await self._send_uma_weight_control(obj)
+
+    async def load_uma_weight_group(
+        self,
+        obj: LoadWeightGroupReq,
+    ) -> UMAWeightReqOutput:
+        return await self._send_uma_weight_control(obj)
+
+    async def evict_uma_weight_group(
+        self,
+        obj: EvictWeightGroupReq,
+    ) -> UMAWeightReqOutput:
+        return await self._send_uma_weight_control(obj)
+
+    async def get_uma_weight_snapshot(self) -> UMAWeightReqOutput:
+        return await self._send_uma_weight_control(
+            GetUMAWeightSnapshotReq(f"snapshot-{uuid.uuid4().hex}")
+        )
+
+    async def _send_uma_weight_control(self, obj) -> UMAWeightReqOutput:
+        self.auto_create_handle_loop()
+        async with self.model_update_lock.writer_lock:
+            results = await self.uma_weight_communicator(obj)
+        if not results:
+            raise RuntimeError("UMA weight request returned no scheduler result")
         failures = [result for result in results if not result.success]
         return failures[0] if failures else results[0]
 

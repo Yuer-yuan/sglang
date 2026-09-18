@@ -152,6 +152,12 @@ class UMAExecutionSlot:
             except KeyError as exc:
                 raise KeyError(f"runtime is not registered: {instance_id}") from exc
 
+    def unregister(self, instance_id: str) -> None:
+        with self._lock:
+            if self._active_instance_id == instance_id:
+                raise RuntimeBindError("cannot unregister the active runtime")
+            self._runtimes.pop(instance_id, None)
+
     def bind(
         self,
         instance_id: str,
@@ -223,6 +229,26 @@ class UMAExecutionSlot:
                     (f"{self._in_flight_count} worker forward(s) in flight",),
                     self._in_flight_count,
                 )
+            return SafePointResult(UMAControlCode.OK)
+
+    def unbind(self, instance_id: str) -> SafePointResult:
+        with self._lock:
+            self._accepting_forwards = False
+            if self._in_flight_count:
+                return SafePointResult(
+                    UMAControlCode.PINNED_RESOURCE_CONFLICT,
+                    (f"{self._in_flight_count} worker forward(s) in flight",),
+                    self._in_flight_count,
+                )
+            if self._active_instance_id not in {None, instance_id}:
+                return SafePointResult(
+                    UMAControlCode.MODEL_BIND_FAILURE,
+                    (
+                        f"active runtime is {self._active_instance_id}, "
+                        f"not {instance_id}",
+                    ),
+                )
+            self._active_instance_id = None
             return SafePointResult(UMAControlCode.OK)
 
     def resume(self) -> None:

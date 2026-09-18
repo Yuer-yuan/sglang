@@ -278,8 +278,27 @@ class TpModelWorkerClient:
     def quiesce_uma_runtime(self):
         return self.worker.quiesce_uma_runtime()
 
+    def unbind_uma_runtime(self, instance_id: str):
+        return self.worker.unbind_uma_runtime(instance_id)
+
     def resume_uma_runtime(self) -> None:
         self.worker.resume_uma_runtime()
+
+    def prepare_uma_model(self, request):
+        return self.worker.prepare_uma_model(request)
+
+    def load_uma_weight_group(self, request):
+        return self.worker.load_uma_weight_group(request)
+
+    def evict_uma_weight_group(self, request):
+        return self.worker.evict_uma_weight_group(request)
+
+    def managed_uma_runtimes(self):
+        return self.worker.managed_uma_runtimes()
+
+    @property
+    def uma_weight_file_reads(self) -> int:
+        return self.worker.uma_weight_file_reads
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.worker.init_weights_update_group(recv_req)

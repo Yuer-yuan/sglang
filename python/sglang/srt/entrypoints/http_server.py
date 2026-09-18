@@ -70,14 +70,17 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    EvictWeightGroupReq,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadWeightGroupReq,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     ProfileReqInput,
     QuiesceInstanceReq,
+    RegisterModelAdapterReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SeparateReasoningReqInput,
@@ -87,6 +90,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    UnbindInstanceReq,
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.template_manager import TemplateManager
@@ -516,6 +520,38 @@ async def quiesce_uma_instance(obj: QuiesceInstanceReq):
     """Expose quiescence as a mechanism fact; this endpoint never drains work."""
 
     result = await _global_state.tokenizer_manager.quiesce_uma_instance(obj)
+    return _uma_control_response(result)
+
+
+@app.post("/uma/unbind_instance")
+async def unbind_uma_instance(obj: UnbindInstanceReq):
+    """Detach a quiesced runtime without evicting its weights or KV."""
+
+    result = await _global_state.tokenizer_manager.unbind_uma_instance(obj)
+    return _uma_control_response(result)
+
+
+@app.post("/uma/register_model")
+async def register_uma_model(obj: RegisterModelAdapterReq):
+    result = await _global_state.tokenizer_manager.register_uma_model(obj)
+    return _uma_control_response(result)
+
+
+@app.post("/uma/load_weight_group")
+async def load_uma_weight_group(obj: LoadWeightGroupReq):
+    result = await _global_state.tokenizer_manager.load_uma_weight_group(obj)
+    return _uma_control_response(result)
+
+
+@app.post("/uma/evict_weight_group")
+async def evict_uma_weight_group(obj: EvictWeightGroupReq):
+    result = await _global_state.tokenizer_manager.evict_uma_weight_group(obj)
+    return _uma_control_response(result)
+
+
+@app.get("/uma/resource_snapshot")
+async def get_uma_weight_snapshot():
+    result = await _global_state.tokenizer_manager.get_uma_weight_snapshot()
     return _uma_control_response(result)
 
 

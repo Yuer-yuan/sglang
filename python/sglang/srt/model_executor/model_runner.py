@@ -20,7 +20,8 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -34,6 +35,22 @@ from sglang.multi_model.uma.execution_slot import (
 from sglang.multi_model.uma.model_adapter import (
     BoundModelRuntime,
     ExecutionResourceBundle,
+    default_adapter_registry,
+)
+from sglang.multi_model.uma.runtime_registry import (
+    ManagedModelRuntime,
+    ManagedRuntimeRegistry,
+)
+from sglang.multi_model.uma.weight_plan import (
+    StageWeightScope,
+    build_safetensors_catalog,
+    build_weight_plan,
+)
+from sglang.multi_model.uma.weight_runtime import (
+    BoundedWeightReservation,
+    LocalLeaseTable,
+    SafetensorsExtentReader,
+    WeightRuntime,
 )
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -255,6 +272,9 @@ class ModelRunner:
         self.active_placement_version: Optional[int] = None
         self.active_resource_epoch: Optional[int] = None
         self.active_weight_epoch: Optional[int] = None
+        self._uma_managed_runtimes = ManagedRuntimeRegistry()
+        self._uma_weight_reader = SafetensorsExtentReader()
+        self._uma_weight_leases = LocalLeaseTable()
 
     @property
     def uma_in_flight_count(self) -> int:
@@ -406,8 +426,277 @@ class ModelRunner:
     def quiesce_uma_runtime(self) -> SafePointResult:
         return self._uma_execution_slot.quiesce()
 
+    def unbind_uma_runtime(self, instance_id: str) -> SafePointResult:
+        result = self._uma_execution_slot.unbind(instance_id)
+        if result.accepted:
+            self.active_instance_id = None
+            self.active_placement_version = None
+            self.active_resource_epoch = None
+            self.active_weight_epoch = None
+        return result
+
     def resume_uma_runtime(self) -> None:
         self._uma_execution_slot.resume()
+
+    def prepare_uma_model(self, request) -> ManagedModelRuntime:
+        """Create model metadata and execution resources without another worker."""
+
+        identity = request.identity
+        if request.adopt_bootstrap:
+            model_path = Path(request.model_path).resolve()
+            current_path = Path(self.model_config.model_path).resolve()
+            if model_path != current_path:
+                raise ValueError(
+                    "bootstrap adoption model path does not match the active model"
+                )
+            model_config = self.model_config
+            load_config = self.load_config
+            module = self.model
+        else:
+            model_config = ModelConfig(
+                request.model_path,
+                trust_remote_code=self.server_args.trust_remote_code,
+                model_override_args="{}",
+                enable_multimodal=False,
+                dtype=str(self.model_config.dtype).removeprefix("torch."),
+            )
+            if model_config.is_multimodal or model_config.is_hybrid:
+                raise ValueError(
+                    "UMA shared slot currently supports dense non-hybrid text models"
+                )
+            load_config = LoadConfig(load_format="safetensors")
+
+        layer_range = identity.optional_layer_or_block_range or (
+            0,
+            model_config.num_hidden_layers,
+        )
+        stage = StageWeightScope(
+            stage_id=identity.stage_id,
+            layer_range=layer_range,
+            owns_input_embedding=request.owns_input_embedding,
+            owns_final_norm=request.owns_final_norm,
+            owns_output_head=request.owns_output_head,
+        )
+        adapter = default_adapter_registry().create(
+            model_config,
+            load_config,
+            stage,
+        )
+        plan = build_weight_plan(
+            build_safetensors_catalog(Path(request.model_path)),
+            adapter,
+            request.checkpoint_digest,
+            stage,
+            request.group_layer_count,
+        )
+        weight_runtime = WeightRuntime(
+            reader=self._uma_weight_reader,
+            lease_table=self._uma_weight_leases,
+            device=torch.device(self.device),
+        )
+
+        if request.adopt_bootstrap:
+            for group in plan.groups:
+                group_identity = replace(
+                    identity,
+                    resource_kind="WEIGHT",
+                    resource_group_id_or_extent_id=group.group_id,
+                    optional_layer_or_block_range=group.layer_range,
+                )
+                weight_runtime.adopt_group(
+                    group_identity,
+                    adapter,
+                    module,
+                    group,
+                )
+            resources = self._capture_uma_execution_resources(weight_runtime)
+            runtime_buffer_bytes = adapter.runtime_buffer_storage_bytes(module)
+        else:
+            module = adapter.build_meta_module()
+            runtime_buffer_bytes = adapter.materialize_runtime_buffers(
+                module,
+                torch.device(self.device),
+            )
+            resources = self._build_uma_execution_resources(
+                model_config,
+                module,
+                weight_runtime,
+                max_total_tokens=request.max_total_tokens,
+                max_running_requests=request.max_running_requests,
+            )
+
+        record = ManagedModelRuntime(
+            deployment_id=identity.deployment_id,
+            placement_version=identity.placement_version,
+            instance_id=identity.instance_id,
+            stage_id=identity.stage_id,
+            resource_epoch=identity.resource_epoch,
+            checkpoint_digest=request.checkpoint_digest,
+            model_config=model_config,
+            load_config=load_config,
+            adapter=adapter,
+            module=module,
+            plan=plan,
+            weight_runtime=weight_runtime,
+            execution_resources=resources,
+            runtime_buffer_bytes=runtime_buffer_bytes,
+        )
+        self._uma_managed_runtimes.add(record)
+        return record
+
+    def load_uma_weight_group(self, request):
+        identity = request.identity
+        record = self._require_matching_uma_record(identity)
+        group = record.group(identity.resource_group_id_or_extent_id)
+        if group.layer_range != identity.optional_layer_or_block_range:
+            raise ValueError("weight group layer range does not match its plan")
+        reservation = BoundedWeightReservation(
+            request.final_bytes,
+            request.staging_bytes,
+        )
+        loaded = record.weight_runtime.load_group(
+            identity,
+            record.adapter,
+            record.module,
+            group,
+            reservation,
+        )
+        return record, loaded
+
+    def evict_uma_weight_group(self, request):
+        identity = request.identity
+        record = self._require_matching_uma_record(identity)
+        if self._uma_execution_slot.active_instance_id == identity.instance_id:
+            raise RuntimeError("cannot evict weights from the active runtime")
+        released = record.weight_runtime.evict_group(
+            identity.resource_group_id_or_extent_id,
+            request.expected_epoch,
+            instance_id=identity.instance_id,
+        )
+        record.published = False
+        self._uma_execution_slot.unregister(identity.instance_id)
+        return record, released
+
+    def managed_uma_runtimes(self) -> tuple[ManagedModelRuntime, ...]:
+        return self._uma_managed_runtimes.all()
+
+    @property
+    def uma_weight_file_reads(self) -> int:
+        return self._uma_weight_reader.read_count
+
+    def _require_matching_uma_record(self, identity) -> ManagedModelRuntime:
+        record = self._uma_managed_runtimes.require(identity.instance_id)
+        if record.deployment_id != identity.deployment_id:
+            raise ValueError("deployment identity does not match prepared model")
+        if record.stage_id != identity.stage_id:
+            raise ValueError("stage identity does not match prepared model")
+        if record.placement_version != identity.placement_version:
+            raise ValueError("placement version does not match prepared model")
+        if record.resource_epoch != identity.resource_epoch:
+            raise ValueError("resource epoch does not match prepared model")
+        return record
+
+    def _capture_uma_execution_resources(
+        self,
+        weight_runtime: WeightRuntime,
+    ) -> ExecutionResourceBundle:
+        return ExecutionResourceBundle(
+            attention_backend=self.attn_backend,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            sampler=self.sampler,
+            logits_processor=self.model.logits_processor,
+            kv_cache_dtype=self.kv_cache_dtype,
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_running_requests=self.req_to_token_pool.size,
+            max_req_len=min(
+                self.model_config.context_len - 1,
+                self.max_total_num_tokens - 1,
+            ),
+            max_req_input_len=min(
+                self.model_config.context_len - 1,
+                self.max_total_num_tokens - 1,
+            )
+            - 5,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            weight_runtime=weight_runtime,
+            cuda_graph_runner=self.cuda_graph_runner,
+            cuda_graph_mem_usage=self.cuda_graph_mem_usage,
+        )
+
+    def _build_uma_execution_resources(
+        self,
+        model_config: ModelConfig,
+        module,
+        weight_runtime: WeightRuntime,
+        *,
+        max_total_tokens: int,
+        max_running_requests: int,
+    ) -> ExecutionResourceBundle:
+        names = (
+            "model_config",
+            "model",
+            "is_generation",
+            "is_multimodal",
+            "is_multimodal_chunked_prefill_supported",
+            "is_hybrid",
+            "use_mla_backend",
+            "attention_chunk_size",
+            "dtype",
+            "start_layer",
+            "end_layer",
+            "num_effective_layers",
+            "req_to_token_pool",
+            "token_to_kv_pool",
+            "token_to_kv_pool_allocator",
+            "attn_backend",
+            "sampler",
+            "kv_cache_dtype",
+            "max_total_num_tokens",
+            "cuda_graph_runner",
+            "cuda_graph_mem_usage",
+        )
+        previous = {name: getattr(self, name, None) for name in names}
+        previous_global_mla = global_server_args_dict.get("use_mla_backend")
+        try:
+            self.model_config = model_config
+            self.model = module
+            self.is_generation = model_config.is_generation
+            self.is_multimodal = model_config.is_multimodal
+            self.is_multimodal_chunked_prefill_supported = (
+                model_config.is_multimodal_chunked_prefill_supported
+            )
+            self.is_hybrid = model_config.is_hybrid
+            self.use_mla_backend = model_config.attention_arch == AttentionArch.MLA
+            self.attention_chunk_size = model_config.attention_chunk_size
+            self.dtype = model_config.dtype
+            self.start_layer = getattr(module, "start_layer", 0)
+            self.end_layer = getattr(
+                module,
+                "end_layer",
+                model_config.num_hidden_layers,
+            )
+            self.num_effective_layers = self.end_layer - self.start_layer
+            self.req_to_token_pool = None
+            self.token_to_kv_pool = None
+            self.token_to_kv_pool_allocator = None
+            self.sampler = Sampler()
+            self.cuda_graph_runner = None
+            self.cuda_graph_mem_usage = 0
+            global_server_args_dict["use_mla_backend"] = self.use_mla_backend
+            self.init_memory_pool(
+                0,
+                max_num_reqs=max_running_requests,
+                max_total_tokens=max_total_tokens,
+            )
+            self.init_attention_backend()
+            return self._capture_uma_execution_resources(weight_runtime)
+        finally:
+            for name, value in previous.items():
+                setattr(self, name, value)
+            global_server_args_dict["use_mla_backend"] = previous_global_mla
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args

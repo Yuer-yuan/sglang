@@ -80,6 +80,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetUMAWeightSnapshotReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -87,6 +88,8 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    EvictWeightGroupReq,
+    LoadWeightGroupReq,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
@@ -95,6 +98,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqOutput,
     ProfileReqType,
     QuiesceInstanceReq,
+    RegisterModelAdapterReq,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -108,6 +112,9 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UMAControlReqOutput,
+    UMAWeightGroupInfo,
+    UMAWeightReqOutput,
+    UnbindInstanceReq,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -509,6 +516,11 @@ class Scheduler(
                 (CloseSessionReqInput, self.close_session),
                 (BindInstanceReq, self.bind_uma_instance),
                 (QuiesceInstanceReq, self.quiesce_uma_instance),
+                (UnbindInstanceReq, self.unbind_uma_instance),
+                (RegisterModelAdapterReq, self.register_uma_model_adapter),
+                (LoadWeightGroupReq, self.load_uma_weight_group),
+                (EvictWeightGroupReq, self.evict_uma_weight_group),
+                (GetUMAWeightSnapshotReq, self.get_uma_weight_snapshot),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
                 (
@@ -1153,6 +1165,234 @@ class Scheduler(
             recv_req,
             result.code,
             "; ".join(result.reasons),
+        )
+
+    def unbind_uma_instance(
+        self,
+        recv_req: UnbindInstanceReq,
+    ) -> UMAControlReqOutput:
+        safe_point = self.reach_uma_safe_point()
+        if not safe_point.accepted:
+            return self._uma_output(
+                recv_req,
+                safe_point.code,
+                "; ".join(safe_point.reasons),
+            )
+        result = self.tp_worker.unbind_uma_runtime(
+            recv_req.identity.instance_id
+        )
+        if result.accepted:
+            self._uma_active_instance_id = None
+        return self._uma_output(
+            recv_req,
+            result.code,
+            "; ".join(result.reasons),
+        )
+
+    @staticmethod
+    def _uma_group_info(record) -> tuple[UMAWeightGroupInfo, ...]:
+        residents = {
+            item.group.group_id: item.resident_bytes
+            for item in record.weight_runtime.resident_groups()
+            if getattr(item.identity, "instance_id", None) == record.instance_id
+        }
+        return tuple(
+            UMAWeightGroupInfo(
+                instance_id=record.instance_id,
+                group_id=group.group_id,
+                layer_range=group.layer_range,
+                logical_bytes=group.logical_bytes,
+                required_resident_bytes=record.adapter.group_storage_bytes(
+                    record.module,
+                    group,
+                ),
+                resident_bytes=residents.get(group.group_id, 0),
+                staging_bytes=max(item.nbytes for item in group.tensors),
+                state=(
+                    "RESIDENT_EVICTABLE"
+                    if group.group_id in record.ready_groups
+                    else "ABSENT"
+                ),
+            )
+            for group in record.plan.groups
+        )
+
+    def _uma_weight_output(
+        self,
+        recv_req,
+        *,
+        action: str,
+        record=None,
+        success: bool = True,
+        code: str = "OK",
+        resident_bytes: int = 0,
+        released_bytes: int = 0,
+        message: str = "",
+    ) -> UMAWeightReqOutput:
+        identity = getattr(recv_req, "identity", None)
+        records = (
+            (record,)
+            if record is not None
+            else self.tp_worker.managed_uma_runtimes()
+        )
+        groups = tuple(
+            group
+            for item in records
+            for group in self._uma_group_info(item)
+        )
+        ready = tuple(
+            sorted(
+                group.group_id
+                for group in groups
+                if group.state != "ABSENT"
+            )
+        )
+        required = tuple(sorted(group.group_id for group in groups))
+        return UMAWeightReqOutput(
+            success=success,
+            code=code,
+            action=action,
+            operation_id=(
+                identity.operation_id
+                if identity is not None
+                else recv_req.operation_id
+            ),
+            instance_id=(identity.instance_id if identity is not None else "*"),
+            placement_version=(
+                identity.placement_version if identity is not None else 0
+            ),
+            resource_epoch=(
+                identity.resource_epoch if identity is not None else 0
+            ),
+            groups=groups,
+            ready_weight_groups=ready,
+            required_weight_groups=required,
+            resident_bytes=resident_bytes,
+            runtime_buffer_bytes=sum(
+                item.runtime_buffer_bytes for item in records
+            ),
+            released_bytes=released_bytes,
+            weight_file_reads=self.tp_worker.uma_weight_file_reads,
+            message=message,
+        )
+
+    def register_uma_model_adapter(
+        self,
+        recv_req: RegisterModelAdapterReq,
+    ) -> UMAWeightReqOutput:
+        safe_point = self.reach_uma_safe_point()
+        if not safe_point.accepted:
+            return self._uma_weight_output(
+                recv_req,
+                action="REGISTER_MODEL",
+                success=False,
+                code=safe_point.code.value,
+                message="; ".join(safe_point.reasons),
+            )
+        try:
+            record = self.tp_worker.prepare_uma_model(recv_req)
+            if record.complete:
+                self.register_uma_runtime(record.bindable_runtime())
+                record.published = True
+            return self._uma_weight_output(
+                recv_req,
+                action="REGISTER_MODEL",
+                record=record,
+                resident_bytes=record.resident_bytes,
+            )
+        except Exception as exc:
+            return self._uma_weight_output(
+                recv_req,
+                action="REGISTER_MODEL",
+                success=False,
+                code="MODEL_BIND_FAILURE",
+                message=str(exc),
+            )
+
+    def load_uma_weight_group(
+        self,
+        recv_req: LoadWeightGroupReq,
+    ) -> UMAWeightReqOutput:
+        safe_point = self.reach_uma_safe_point()
+        if not safe_point.accepted:
+            return self._uma_weight_output(
+                recv_req,
+                action="LOAD_WEIGHT_GROUP",
+                success=False,
+                code=safe_point.code.value,
+                message="; ".join(safe_point.reasons),
+            )
+        try:
+            record, loaded = self.tp_worker.load_uma_weight_group(recv_req)
+            if record.complete and not record.published:
+                self.register_uma_runtime(record.bindable_runtime())
+                record.published = True
+            return self._uma_weight_output(
+                recv_req,
+                action="LOAD_WEIGHT_GROUP",
+                record=record,
+                resident_bytes=loaded.resident_bytes,
+            )
+        except Exception as exc:
+            message = str(exc)
+            code = (
+                "CHECKSUM_MISMATCH"
+                if "checksum" in message.lower()
+                else "MODEL_BIND_FAILURE"
+            )
+            return self._uma_weight_output(
+                recv_req,
+                action="LOAD_WEIGHT_GROUP",
+                success=False,
+                code=code,
+                message=message,
+            )
+
+    def evict_uma_weight_group(
+        self,
+        recv_req: EvictWeightGroupReq,
+    ) -> UMAWeightReqOutput:
+        safe_point = self.reach_uma_safe_point()
+        if not safe_point.accepted:
+            return self._uma_weight_output(
+                recv_req,
+                action="EVICT_WEIGHT_GROUP",
+                success=False,
+                code=safe_point.code.value,
+                message="; ".join(safe_point.reasons),
+            )
+        try:
+            record, released = self.tp_worker.evict_uma_weight_group(recv_req)
+            return self._uma_weight_output(
+                recv_req,
+                action="EVICT_WEIGHT_GROUP",
+                record=record,
+                released_bytes=released.released_bytes,
+            )
+        except Exception as exc:
+            message = str(exc)
+            code = (
+                "PINNED_RESOURCE_CONFLICT"
+                if "active" in message.lower() or "pinned" in message.lower()
+                else "MODEL_BIND_FAILURE"
+            )
+            return self._uma_weight_output(
+                recv_req,
+                action="EVICT_WEIGHT_GROUP",
+                success=False,
+                code=code,
+                message=message,
+            )
+
+    def get_uma_weight_snapshot(
+        self,
+        recv_req: GetUMAWeightSnapshotReq,
+    ) -> UMAWeightReqOutput:
+        records = self.tp_worker.managed_uma_runtimes()
+        return self._uma_weight_output(
+            recv_req,
+            action="RESOURCE_SNAPSHOT",
+            resident_bytes=sum(record.resident_bytes for record in records),
         )
 
     def _adopt_uma_runtime(self, runtime: BoundModelRuntime) -> None:

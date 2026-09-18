@@ -68,6 +68,99 @@ class LeaseBackend(Protocol):
     def is_evictable(self, resource: Any) -> bool: ...
 
 
+class LocalLease:
+    """Worker-local lease; the Node Agent remains the policy authority."""
+
+    def __init__(
+        self,
+        table: "LocalLeaseTable",
+        resources: tuple[Any, ...],
+    ) -> None:
+        self._table = table
+        self._resources = resources
+        self._active = True
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def release(self) -> None:
+        if not self._active:
+            return
+        self._table.release(self._resources)
+        self._active = False
+
+
+class LocalLeaseTable:
+    """Protect resident worker objects against eviction during a forward."""
+
+    def __init__(self) -> None:
+        self._holds: dict[Any, int] = {}
+        self._lock = threading.RLock()
+
+    def acquire(self, resources: tuple[Any, ...], owner: str) -> LocalLease:
+        if not owner.strip():
+            raise ValueError("lease owner must not be empty")
+        if not resources:
+            raise ValueError("lease requires at least one resource")
+        with self._lock:
+            for resource in resources:
+                self._holds[resource] = self._holds.get(resource, 0) + 1
+        return LocalLease(self, resources)
+
+    def release(self, resources: tuple[Any, ...]) -> None:
+        with self._lock:
+            for resource in resources:
+                count = self._holds.get(resource, 0)
+                if count <= 0:
+                    raise RuntimeError("weight lease count underflow")
+                if count == 1:
+                    del self._holds[resource]
+                else:
+                    self._holds[resource] = count - 1
+
+    def is_evictable(self, resource: Any) -> bool:
+        with self._lock:
+            return self._holds.get(resource, 0) == 0
+
+
+class BoundedWeightReservation:
+    """Worker check for a reservation already granted by the Node Agent."""
+
+    def __init__(self, final_bytes: int, staging_bytes: int) -> None:
+        if final_bytes <= 0:
+            raise ValueError("final_bytes must be positive")
+        if staging_bytes < 0:
+            raise ValueError("staging_bytes must be non-negative")
+        self._final_bytes = final_bytes
+        self._staging_bytes = staging_bytes
+        self._active = True
+        self.committed_bytes: int | None = None
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def final_bytes(self) -> int:
+        return self._final_bytes
+
+    @property
+    def staging_bytes(self) -> int:
+        return self._staging_bytes
+
+    def commit(self, resident_bytes: int) -> None:
+        if not self._active:
+            raise RuntimeError("reservation is inactive")
+        if resident_bytes < 0 or resident_bytes > self._final_bytes:
+            raise ValueError("resident bytes exceed worker reservation")
+        self.committed_bytes = resident_bytes
+        self._active = False
+
+    def release(self) -> None:
+        self._active = False
+
+
 class AllocatorControl(Protocol):
     def synchronize(self) -> None: ...
 
@@ -265,6 +358,46 @@ class WeightRuntime:
         # CUDA allocator deltas are only attributable while materialization is
         # serialized.  SSD prefetch may run in parallel before this section.
         self._allocation_lock = threading.Lock()
+
+    def adopt_group(
+        self,
+        identity: Any,
+        adapter: ModelAdapter,
+        module: Any,
+        group: WeightGroupSpec,
+    ) -> LoadedWeightGroup:
+        """Take ownership of an already materialized bootstrap weight group."""
+
+        key = self._logical_key(identity, group.group_id)
+        validation = adapter.validate_group(module, group)
+        if not validation.ok:
+            raise GroupValidationError(group.group_id, validation)
+        expected_bytes = adapter.group_storage_bytes(module, group)
+        if validation.resident_bytes != expected_bytes:
+            raise WeightRuntimeError(
+                f"weight group {group.group_id} bootstrap storage mismatch: "
+                f"expected {expected_bytes}, observed {validation.resident_bytes}"
+            )
+        record = LoadedWeightGroup(
+            identity=identity,
+            group=group,
+            adapter=adapter,
+            module=module,
+            state=WeightResidencyState.RESIDENT_EVICTABLE,
+            parameter_bytes=validation.resident_bytes,
+            resident_bytes=validation.resident_bytes,
+            resource_epoch=self._resource_epoch(identity),
+        )
+        with self._lock:
+            if key in self._loading or any(
+                self._logical_key(item.identity, item.group.group_id) == key
+                for item in self._records.values()
+            ):
+                raise WeightRuntimeError(
+                    f"weight group is already loading or resident: {key}"
+                )
+            self._records[identity] = record
+        return record
 
     def load_group(
         self,

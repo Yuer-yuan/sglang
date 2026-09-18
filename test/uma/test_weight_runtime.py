@@ -51,6 +51,8 @@ WeightGroupSpec = weight_plan.WeightGroupSpec
 WeightKind = weight_plan.WeightKind
 PinnedWeightConflict = weight_runtime.PinnedWeightConflict
 StaleWeightEpoch = weight_runtime.StaleWeightEpoch
+BoundedWeightReservation = weight_runtime.BoundedWeightReservation
+LocalLeaseTable = weight_runtime.LocalLeaseTable
 WeightResidencyState = weight_runtime.WeightResidencyState
 WeightRuntime = weight_runtime.WeightRuntime
 
@@ -375,3 +377,40 @@ def test_extent_reader_rejects_checksum_mismatch_and_short_read(tmp_path):
 
     assert reader.read_count == 0
     assert reader.bytes_read == 0
+
+
+def test_adopt_bootstrap_group_without_reading_or_allocating_again():
+    subject = runtime()
+    module = Module()
+    module.materialized = True
+    subject.allocator.allocated = 16
+
+    adopted = subject.adopt_group(
+        Identity(),
+        adapter(subject),
+        module,
+        group(),
+    )
+
+    assert adopted.parameter_bytes == 16
+    assert adopted.resident_bytes == 16
+    assert subject.reader.calls == []
+    assert subject.allocator.allocated == 16
+    assert subject.readiness("model-a") == frozenset({"layers-0-1"})
+
+
+def test_local_lease_table_and_bounded_reservation_enforce_worker_limits():
+    table = LocalLeaseTable()
+    resource = Identity()
+    lease = table.acquire((resource,), "batch-1")
+    assert not table.is_evictable(resource)
+    lease.release()
+    assert table.is_evictable(resource)
+
+    reservation = BoundedWeightReservation(16, 8)
+    reservation.commit(12)
+    assert reservation.committed_bytes == 12
+    assert not reservation.active
+
+    with pytest.raises(ValueError, match="exceed"):
+        BoundedWeightReservation(16, 8).commit(17)

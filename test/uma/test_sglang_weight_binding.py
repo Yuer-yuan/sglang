@@ -58,9 +58,13 @@ assess_scheduler_safe_point = execution_slot.assess_scheduler_safe_point
 class Module:
     def __init__(self) -> None:
         self.logits_processor = object()
+        self.runtime_buffers = []
 
     def forward(self, input_ids, positions, forward_batch):
         return input_ids
+
+    def named_buffers(self):
+        return tuple(self.runtime_buffers)
 
 
 class WeightLease:
@@ -158,6 +162,20 @@ def test_partial_execution_resource_bundle_is_rejected():
 
     with pytest.raises(ValueError, match="attention_backend"):
         slot.register(runtime(missing_resource="attention_backend"))
+
+
+def test_runtime_with_meta_constructor_buffer_is_rejected_before_forward():
+    slot = UMAExecutionSlot()
+    candidate = runtime()
+    candidate.module.runtime_buffers.append(
+        (
+            "model.layers.0.self_attn.rotary_emb.cos_sin_cache",
+            SimpleNamespace(device=SimpleNamespace(type="meta")),
+        )
+    )
+
+    with pytest.raises(ValueError, match="unmaterialized model buffers"):
+        slot.register(candidate)
 
 
 def test_bind_is_deferred_while_forward_lease_is_active():

@@ -777,6 +777,9 @@ class RegisterModelAdapterReq:
     owns_final_norm: bool
     owns_output_head: bool
     group_layer_count: int = 1
+    max_total_tokens: int = 512
+    max_running_requests: int = 2
+    adopt_bootstrap: bool = False
 
     def __post_init__(self):
         for name in ("model_path", "checkpoint_digest", "architecture", "kv_layout"):
@@ -784,6 +787,8 @@ class RegisterModelAdapterReq:
                 raise ValueError(f"{name} must not be empty")
         if self.group_layer_count <= 0:
             raise ValueError("group_layer_count must be positive")
+        if self.max_total_tokens <= 0 or self.max_running_requests <= 0:
+            raise ValueError("runtime pool limits must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -825,6 +830,11 @@ class QuiesceInstanceReq:
 
 
 @dataclass(frozen=True, slots=True)
+class UnbindInstanceReq:
+    identity: UMAResourceIdentity
+
+
+@dataclass(frozen=True, slots=True)
 class UMAControlReqOutput:
     success: bool
     code: str
@@ -833,6 +843,46 @@ class UMAControlReqOutput:
     placement_version: int
     resource_epoch: int
     message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class UMAWeightGroupInfo:
+    instance_id: str
+    group_id: str
+    layer_range: Optional[tuple[int, int]]
+    logical_bytes: int
+    required_resident_bytes: int
+    resident_bytes: int
+    staging_bytes: int
+    state: str
+
+
+@dataclass(frozen=True, slots=True)
+class UMAWeightReqOutput:
+    success: bool
+    code: str
+    action: str
+    operation_id: str
+    instance_id: str
+    placement_version: int
+    resource_epoch: int
+    groups: tuple[UMAWeightGroupInfo, ...] = ()
+    ready_weight_groups: tuple[str, ...] = ()
+    required_weight_groups: tuple[str, ...] = ()
+    resident_bytes: int = 0
+    runtime_buffer_bytes: int = 0
+    released_bytes: int = 0
+    weight_file_reads: int = 0
+    message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class GetUMAWeightSnapshotReq:
+    operation_id: str
+
+    def __post_init__(self):
+        if not self.operation_id.strip():
+            raise ValueError("operation_id must not be empty")
 
 
 @dataclass

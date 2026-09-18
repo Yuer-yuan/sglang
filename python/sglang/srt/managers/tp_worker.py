@@ -245,8 +245,27 @@ class TpModelWorker:
     def quiesce_uma_runtime(self) -> SafePointResult:
         return self.model_runner.quiesce_uma_runtime()
 
+    def unbind_uma_runtime(self, instance_id: str) -> SafePointResult:
+        return self.model_runner.unbind_uma_runtime(instance_id)
+
     def resume_uma_runtime(self) -> None:
         self.model_runner.resume_uma_runtime()
+
+    def prepare_uma_model(self, request):
+        return self.model_runner.prepare_uma_model(request)
+
+    def load_uma_weight_group(self, request):
+        return self.model_runner.load_uma_weight_group(request)
+
+    def evict_uma_weight_group(self, request):
+        return self.model_runner.evict_uma_weight_group(request)
+
+    def managed_uma_runtimes(self):
+        return self.model_runner.managed_uma_runtimes()
+
+    @property
+    def uma_weight_file_reads(self) -> int:
+        return self.model_runner.uma_weight_file_reads
 
     def forward_batch_generation(
         self,

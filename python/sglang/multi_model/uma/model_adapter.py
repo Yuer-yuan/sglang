@@ -125,6 +125,21 @@ class BoundModelRuntime:
         module_logits = getattr(self.module, "logits_processor", None)
         if module_logits is not self.execution_resources.logits_processor:
             raise ValueError("logits processor does not belong to the bound module")
+        named_buffers = getattr(self.module, "named_buffers", None)
+        meta_buffers = (
+            [
+                name
+                for name, buffer in named_buffers()
+                if buffer.device.type == "meta"
+            ]
+            if callable(named_buffers)
+            else []
+        )
+        if meta_buffers:
+            raise ValueError(
+                "runtime contains unmaterialized model buffers: "
+                f"{meta_buffers[:8]}"
+            )
 
 
 class ModelAdapter(ABC):
@@ -178,6 +193,81 @@ class ModelAdapter(ABC):
                 f"metadata model allocated non-meta parameters: {non_meta[:8]}"
             )
         return module
+
+    def materialize_runtime_buffers(self, module: Any, device: Any) -> int:
+        """Materialize non-checkpoint state created by model constructors.
+
+        A metadata model puts both parameters and buffers on the meta device.
+        Weight groups replace checkpoint-backed parameters, but generated
+        state such as RoPE caches never appears in safetensors.  Such buffers
+        must be rebuilt explicitly before the runtime can be published.
+
+        The first dense-decoder implementation deliberately supports only the
+        zero-argument ``_compute_cos_sin_cache`` contract used by the Qwen3,
+        Llama and Mistral rotary modules.  An unfamiliar meta buffer fails
+        registration loudly instead of surviving until the first forward.
+        """
+        import torch
+
+        materialized: dict[int, Any] = {}
+        unsupported: list[str] = []
+        for module_name, owner in module.named_modules():
+            for buffer_name, buffer in tuple(owner._buffers.items()):
+                if buffer is None or buffer.device.type != "meta":
+                    continue
+                qualified_name = (
+                    f"{module_name}.{buffer_name}" if module_name else buffer_name
+                )
+                builder = getattr(owner, "_compute_cos_sin_cache", None)
+                if buffer_name != "cos_sin_cache" or not callable(builder):
+                    unsupported.append(qualified_name)
+                    continue
+                try:
+                    with torch.device(device):
+                        replacement = builder()
+                    replacement = replacement.to(
+                        device=device,
+                        dtype=buffer.dtype,
+                    )
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "runtime buffer builder requires unsupported arguments: "
+                        f"{qualified_name}"
+                    ) from exc
+                owner._buffers[buffer_name] = replacement
+                materialized[id(replacement)] = replacement
+
+        if unsupported:
+            raise RuntimeError(
+                "metadata model contains unsupported runtime buffers: "
+                f"{unsupported[:8]}"
+            )
+
+        remaining = [
+            name
+            for name, buffer in module.named_buffers()
+            if buffer.device.type == "meta"
+        ]
+        if remaining:
+            raise RuntimeError(
+                "runtime buffers remain meta after materialization: "
+                f"{remaining[:8]}"
+            )
+        return sum(
+            buffer.numel() * buffer.element_size()
+            for buffer in materialized.values()
+        )
+
+    @staticmethod
+    def runtime_buffer_storage_bytes(module: Any) -> int:
+        unique: dict[int, Any] = {}
+        for buffer in module.buffers():
+            if buffer.device.type != "meta":
+                unique[id(buffer)] = buffer
+        return sum(
+            buffer.numel() * buffer.element_size()
+            for buffer in unique.values()
+        )
 
     def runtime_parameter_names(self, group: WeightGroupSpec) -> frozenset[str]:
         return frozenset(
