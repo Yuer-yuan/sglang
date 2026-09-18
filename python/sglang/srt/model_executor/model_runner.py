@@ -26,6 +26,15 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from sglang.multi_model.uma.execution_slot import (
+    RuntimeBindResult,
+    SafePointResult,
+    UMAExecutionSlot,
+)
+from sglang.multi_model.uma.model_adapter import (
+    BoundModelRuntime,
+    ExecutionResourceBundle,
+)
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -237,6 +246,168 @@ class ModelRunner:
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
         self._model_update_group = {}
+        # The UMA slot is intentionally initialized after the ordinary SGLang
+        # runtime.  Existing single-model startup and update APIs therefore
+        # retain their original behavior until a runtime is explicitly
+        # registered and bound.
+        self._uma_execution_slot = UMAExecutionSlot()
+        self.active_instance_id: Optional[str] = None
+        self.active_placement_version: Optional[int] = None
+        self.active_resource_epoch: Optional[int] = None
+        self.active_weight_epoch: Optional[int] = None
+
+    @property
+    def uma_in_flight_count(self) -> int:
+        return self._uma_execution_slot.in_flight_count
+
+    def register_uma_runtime(
+        self,
+        runtime: BoundModelRuntime,
+        *,
+        replace: bool = False,
+    ) -> None:
+        self._uma_execution_slot.register(runtime, replace=replace)
+
+    def get_uma_runtime(self, instance_id: str) -> BoundModelRuntime:
+        return self._uma_execution_slot.get(instance_id)
+
+    def capture_current_uma_runtime(
+        self,
+        *,
+        deployment_id: str,
+        placement_version: int,
+        instance_id: str,
+        stage_id: str,
+        resource_epoch: int,
+        weight_epoch: int,
+        kv_layout: Optional[str] = None,
+    ) -> BoundModelRuntime:
+        """Capture the currently bound complete runner state for rollback.
+
+        This does not duplicate CUDA storage.  It stores references to the
+        model-shaped resources that already belong to this worker.
+        """
+
+        logits_processor = getattr(self.model, "logits_processor", None)
+        bundle = ExecutionResourceBundle(
+            attention_backend=self.attn_backend,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            sampler=self.sampler,
+            logits_processor=logits_processor,
+            kv_cache_dtype=self.kv_cache_dtype,
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_running_requests=self.req_to_token_pool.size,
+            max_req_len=min(
+                self.model_config.context_len - 1,
+                self.max_total_num_tokens - 1,
+            ),
+            max_req_input_len=min(
+                self.model_config.context_len - 1,
+                self.max_total_num_tokens - 1,
+            )
+            - 5,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            cuda_graph_runner=self.cuda_graph_runner,
+            cuda_graph_mem_usage=self.cuda_graph_mem_usage,
+        )
+        runtime = BoundModelRuntime(
+            deployment_id=deployment_id,
+            placement_version=placement_version,
+            instance_id=instance_id,
+            stage_id=stage_id,
+            resource_epoch=resource_epoch,
+            model_config=self.model_config,
+            module=self.model,
+            kv_layout=kv_layout
+            or f"{type(self.token_to_kv_pool).__module__}."
+            f"{type(self.token_to_kv_pool).__qualname__}",
+            weight_epoch=weight_epoch,
+            required_weight_groups=frozenset(),
+            ready_weight_groups=frozenset(),
+            execution_resources=bundle,
+        )
+        runtime.validate_complete()
+        return runtime
+
+    def bind_runtime(self, runtime: BoundModelRuntime) -> None:
+        """Atomically replace every model-shaped ModelRunner reference."""
+
+        runtime.validate_complete()
+        resources = runtime.execution_resources
+        replacements = {
+            "model": runtime.module,
+            "model_config": runtime.model_config,
+            "attn_backend": resources.attention_backend,
+            "req_to_token_pool": resources.req_to_token_pool,
+            "token_to_kv_pool": resources.token_to_kv_pool,
+            "token_to_kv_pool_allocator": resources.token_to_kv_pool_allocator,
+            "sampler": resources.sampler,
+            "kv_cache_dtype": resources.kv_cache_dtype,
+            "max_total_num_tokens": resources.max_total_num_tokens,
+            "start_layer": resources.start_layer,
+            "end_layer": resources.end_layer,
+            "num_effective_layers": resources.end_layer - resources.start_layer,
+            "cuda_graph_runner": resources.cuda_graph_runner,
+            "cuda_graph_mem_usage": resources.cuda_graph_mem_usage,
+            "dtype": runtime.model_config.dtype,
+            "sliding_window_size": (
+                runtime.module.get_attention_sliding_window_size()
+                if hasattr(runtime.module, "get_attention_sliding_window_size")
+                else None
+            ),
+            "support_pp": "pp_proxy_tensors"
+            in inspect.signature(runtime.module.forward).parameters,
+            "is_generation": runtime.model_config.is_generation,
+            "is_multimodal": runtime.model_config.is_multimodal,
+            "is_multimodal_chunked_prefill_supported": (
+                runtime.model_config.is_multimodal_chunked_prefill_supported
+            ),
+            "is_hybrid": runtime.model_config.is_hybrid,
+            "use_mla_backend": (
+                runtime.model_config.attention_arch == AttentionArch.MLA
+            ),
+            "attention_chunk_size": runtime.model_config.attention_chunk_size,
+            "active_instance_id": runtime.instance_id,
+            "active_placement_version": runtime.placement_version,
+            "active_resource_epoch": runtime.resource_epoch,
+            "active_weight_epoch": runtime.weight_epoch,
+        }
+        if replacements["is_multimodal"]:
+            raise ValueError("UMA execution slot does not support VLM runtimes")
+        old_values = {name: getattr(self, name) for name in replacements}
+        old_global_mla = global_server_args_dict.get("use_mla_backend")
+        try:
+            for name, value in replacements.items():
+                setattr(self, name, value)
+            global_server_args_dict["use_mla_backend"] = self.use_mla_backend
+        except BaseException:
+            for name, value in old_values.items():
+                setattr(self, name, value)
+            global_server_args_dict["use_mla_backend"] = old_global_mla
+            raise
+
+    def bind_uma_runtime(
+        self,
+        instance_id: str,
+        *,
+        placement_version: int,
+        resource_epoch: int,
+    ) -> RuntimeBindResult:
+        return self._uma_execution_slot.bind(
+            instance_id,
+            placement_version=placement_version,
+            resource_epoch=resource_epoch,
+            binder=self.bind_runtime,
+        )
+
+    def quiesce_uma_runtime(self) -> SafePointResult:
+        return self._uma_execution_slot.quiesce()
+
+    def resume_uma_runtime(self) -> None:
+        self._uma_execution_slot.resume()
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -1463,18 +1634,21 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
-        self.forward_pass_id += 1
-
-        with get_global_expert_distribution_recorder().with_forward_pass(
-            self.forward_pass_id,
-            forward_batch,
+        with self._uma_execution_slot.forward_lease(
+            owner=f"forward:{self.forward_pass_id + 1}:{id(forward_batch)}"
         ):
-            output = self._forward_raw(
-                forward_batch, skip_attn_backend_init, pp_proxy_tensors
-            )
+            self.forward_pass_id += 1
 
-        if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end()
+            with get_global_expert_distribution_recorder().with_forward_pass(
+                self.forward_pass_id,
+                forward_batch,
+            ):
+                output = self._forward_raw(
+                    forward_batch, skip_attn_backend_init, pp_proxy_tensors
+                )
+
+            if self.eplb_manager is not None:
+                self.eplb_manager.on_forward_pass_end()
 
         return output
 

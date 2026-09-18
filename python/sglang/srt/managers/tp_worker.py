@@ -15,10 +15,13 @@
 
 import logging
 import threading
+from dataclasses import replace
 from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.multi_model.uma.execution_slot import RuntimeBindResult, SafePointResult
+from sglang.multi_model.uma.model_adapter import BoundModelRuntime
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.hf_transformers_utils import (
@@ -191,6 +194,59 @@ class TpModelWorker:
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool_allocator,
         )
+
+    @property
+    def uma_in_flight_count(self) -> int:
+        return self.model_runner.uma_in_flight_count
+
+    def register_uma_runtime(
+        self,
+        runtime: BoundModelRuntime,
+        *,
+        replace: bool = False,
+    ) -> None:
+        self.model_runner.register_uma_runtime(runtime, replace=replace)
+
+    def get_uma_runtime(self, instance_id: str) -> BoundModelRuntime:
+        return self.model_runner.get_uma_runtime(instance_id)
+
+    def capture_current_uma_runtime(self, **identity) -> BoundModelRuntime:
+        runtime = self.model_runner.capture_current_uma_runtime(**identity)
+        resources = replace(
+            runtime.execution_resources,
+            max_running_requests=self.max_running_requests,
+            max_req_len=self.max_req_len,
+            max_req_input_len=self.max_req_input_len,
+        )
+        return replace(runtime, execution_resources=resources)
+
+    def bind_uma_runtime(
+        self,
+        instance_id: str,
+        *,
+        placement_version: int,
+        resource_epoch: int,
+    ) -> RuntimeBindResult:
+        result = self.model_runner.bind_uma_runtime(
+            instance_id,
+            placement_version=placement_version,
+            resource_epoch=resource_epoch,
+        )
+        if result.accepted:
+            runtime = self.model_runner.get_uma_runtime(instance_id)
+            resources = runtime.execution_resources
+            self.model_config = runtime.model_config
+            self.max_total_num_tokens = resources.max_total_num_tokens
+            self.max_running_requests = resources.max_running_requests
+            self.max_req_len = resources.max_req_len
+            self.max_req_input_len = resources.max_req_input_len
+        return result
+
+    def quiesce_uma_runtime(self) -> SafePointResult:
+        return self.model_runner.quiesce_uma_runtime()
+
+    def resume_uma_runtime(self) -> None:
+        self.model_runner.resume_uma_runtime()
 
     def forward_batch_generation(
         self,

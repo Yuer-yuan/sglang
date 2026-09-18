@@ -38,15 +38,93 @@ class GroupValidation:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionResourceBundle:
+    """All model-shaped objects that must switch as one execution unit."""
+
+    attention_backend: Any
+    req_to_token_pool: Any
+    token_to_kv_pool: Any
+    token_to_kv_pool_allocator: Any
+    sampler: Any
+    logits_processor: Any
+    kv_cache_dtype: Any
+    max_total_num_tokens: int
+    max_running_requests: int
+    max_req_len: int
+    max_req_input_len: int
+    start_layer: int
+    end_layer: int
+    weight_runtime: Any = None
+    cuda_graph_runner: Any = None
+    cuda_graph_mem_usage: int = 0
+
+    def validate(self) -> None:
+        required = {
+            "attention_backend": self.attention_backend,
+            "req_to_token_pool": self.req_to_token_pool,
+            "token_to_kv_pool": self.token_to_kv_pool,
+            "token_to_kv_pool_allocator": self.token_to_kv_pool_allocator,
+            "sampler": self.sampler,
+            "logits_processor": self.logits_processor,
+            "kv_cache_dtype": self.kv_cache_dtype,
+        }
+        missing = sorted(name for name, value in required.items() if value is None)
+        if missing:
+            raise ValueError(f"incomplete execution resource bundle: {missing}")
+        if self.max_total_num_tokens <= 0:
+            raise ValueError("max_total_num_tokens must be positive")
+        if self.max_running_requests <= 0:
+            raise ValueError("max_running_requests must be positive")
+        if self.max_req_len <= 0 or self.max_req_input_len <= 0:
+            raise ValueError("request length limits must be positive")
+        if self.start_layer < 0 or self.end_layer <= self.start_layer:
+            raise ValueError("execution layer range must be non-empty")
+        if self.cuda_graph_mem_usage < 0:
+            raise ValueError("cuda_graph_mem_usage must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
 class BoundModelRuntime:
+    deployment_id: str
+    placement_version: int
     instance_id: str
+    stage_id: str
+    resource_epoch: int
     model_config: Any
     module: Any
-    attention_config: Any
     kv_layout: str
     weight_epoch: int
     required_weight_groups: frozenset[str]
     ready_weight_groups: frozenset[str]
+    execution_resources: ExecutionResourceBundle
+
+    def validate_complete(self) -> None:
+        for name in ("deployment_id", "instance_id", "stage_id", "kv_layout"):
+            if not str(getattr(self, name)).strip():
+                raise ValueError(f"{name} must not be empty")
+        if self.placement_version < 0 or self.resource_epoch < 0:
+            raise ValueError("placement and resource epochs must be non-negative")
+        if self.weight_epoch < 0:
+            raise ValueError("weight_epoch must be non-negative")
+        if self.model_config is None or self.module is None:
+            raise ValueError("model config and module are required")
+        missing = self.required_weight_groups - self.ready_weight_groups
+        if missing:
+            raise ValueError(f"cannot bind missing weight groups: {sorted(missing)}")
+        unexpected = self.ready_weight_groups - self.required_weight_groups
+        if unexpected:
+            raise ValueError(
+                f"runtime reports unknown ready weight groups: {sorted(unexpected)}"
+            )
+        if (
+            self.required_weight_groups
+            and self.execution_resources.weight_runtime is None
+        ):
+            raise ValueError("managed weight groups require a weight runtime")
+        self.execution_resources.validate()
+        module_logits = getattr(self.module, "logits_processor", None)
+        if module_logits is not self.execution_resources.logits_processor:
+            raise ValueError("logits processor does not belong to the bound module")
 
 
 class ModelAdapter(ABC):
@@ -291,30 +369,40 @@ class ModelAdapter(ABC):
 
     def bind_runtime(
         self,
+        deployment_id: str,
+        placement_version: int,
         instance_id: str,
+        stage_id: str,
+        resource_epoch: int,
         module: Any,
         plan: WeightPlan,
         ready_groups: Sequence[str],
         *,
         kv_layout: str,
         weight_epoch: int,
-        attention_config: Any = None,
+        execution_resources: ExecutionResourceBundle,
     ) -> BoundModelRuntime:
         required = frozenset(group.group_id for group in plan.groups)
         ready = frozenset(ready_groups)
         missing = required - ready
         if missing:
             raise ValueError(f"cannot bind missing weight groups: {sorted(missing)}")
-        return BoundModelRuntime(
+        runtime = BoundModelRuntime(
+            deployment_id=deployment_id,
+            placement_version=placement_version,
             instance_id=instance_id,
+            stage_id=stage_id,
+            resource_epoch=resource_epoch,
             model_config=self.model_config,
             module=module,
-            attention_config=attention_config,
             kv_layout=kv_layout,
             weight_epoch=weight_epoch,
             required_weight_groups=required,
             ready_weight_groups=ready,
+            execution_resources=execution_resources,
         )
+        runtime.validate_complete()
+        return runtime
 
 
 class ModelAdapterRegistry:

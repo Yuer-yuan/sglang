@@ -34,6 +34,12 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
+from sglang.multi_model.uma.execution_slot import (
+    SafePointResult,
+    UMAControlCode,
+    assess_scheduler_safe_point,
+)
+from sglang.multi_model.uma.model_adapter import BoundModelRuntime
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.constrained.base_grammar_backend import (
@@ -68,6 +74,7 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    BindInstanceReq,
     CloseSessionReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
@@ -87,6 +94,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    QuiesceInstanceReq,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -99,6 +107,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UMAControlReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -486,6 +495,8 @@ class Scheduler(
         self.init_profier()
         self.init_metrics()
         self.init_kv_events(server_args.kv_events_config)
+        self._uma_bootstrap_registered = False
+        self._uma_active_instance_id: Optional[str] = None
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -496,6 +507,8 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (BindInstanceReq, self.bind_uma_instance),
+                (QuiesceInstanceReq, self.quiesce_uma_instance),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
                 (
@@ -1061,6 +1074,185 @@ class Scheduler(
                         self.recv_from_rpc.send_pyobj(output)
                 else:
                     self.send_to_tokenizer.send_pyobj(output)
+
+    def register_uma_runtime(
+        self,
+        runtime: BoundModelRuntime,
+        *,
+        replace: bool = False,
+    ) -> None:
+        """Register a complete worker-local runtime in the shared slot."""
+
+        if not self._uma_bootstrap_registered:
+            bootstrap = self.tp_worker.capture_current_uma_runtime(
+                deployment_id="__sglang_bootstrap__",
+                placement_version=0,
+                instance_id="__sglang_bootstrap__",
+                stage_id=f"pp-{self.pp_rank}",
+                resource_epoch=0,
+                weight_epoch=0,
+            )
+            self.tp_worker.register_uma_runtime(bootstrap)
+            result = self.tp_worker.bind_uma_runtime(
+                bootstrap.instance_id,
+                placement_version=bootstrap.placement_version,
+                resource_epoch=bootstrap.resource_epoch,
+            )
+            if not result.accepted:
+                raise RuntimeError(f"failed to register bootstrap runtime: {result}")
+            self._uma_active_instance_id = bootstrap.instance_id
+            self._uma_bootstrap_registered = True
+        self.tp_worker.register_uma_runtime(runtime, replace=replace)
+
+    def reach_uma_safe_point(self) -> SafePointResult:
+        if hasattr(self, "running_mbs"):
+            running_counts = tuple(len(batch.reqs) for batch in self.running_mbs)
+        else:
+            running_counts = (len(self.running_batch.reqs),)
+        return assess_scheduler_safe_point(
+            waiting_count=len(self.waiting_queue),
+            running_counts=running_counts,
+            grammar_count=len(self.grammar_queue),
+            session_count=len(self.sessions),
+            has_chunked_request=self.chunked_req is not None,
+            overlap_enabled=self.enable_overlap,
+            overlap_result_count=len(getattr(self, "result_queue", ())),
+            worker_in_flight_count=self.tp_worker.uma_in_flight_count,
+        )
+
+    @staticmethod
+    def _uma_output(
+        recv_req,
+        code: UMAControlCode,
+        message: str = "",
+    ) -> UMAControlReqOutput:
+        identity = recv_req.identity
+        return UMAControlReqOutput(
+            success=code is UMAControlCode.OK,
+            code=code.value,
+            operation_id=identity.operation_id,
+            instance_id=identity.instance_id,
+            placement_version=identity.placement_version,
+            resource_epoch=identity.resource_epoch,
+            message=message,
+        )
+
+    def quiesce_uma_instance(
+        self,
+        recv_req: QuiesceInstanceReq,
+    ) -> UMAControlReqOutput:
+        safe_point = self.reach_uma_safe_point()
+        if not safe_point.accepted:
+            return self._uma_output(
+                recv_req,
+                safe_point.code,
+                "; ".join(safe_point.reasons),
+            )
+        result = self.tp_worker.quiesce_uma_runtime()
+        return self._uma_output(
+            recv_req,
+            result.code,
+            "; ".join(result.reasons),
+        )
+
+    def _adopt_uma_runtime(self, runtime: BoundModelRuntime) -> None:
+        resources = runtime.execution_resources
+        self.model_config = runtime.model_config
+        self.is_generation = runtime.model_config.is_generation
+        self.max_total_num_tokens = resources.max_total_num_tokens
+        self.max_running_requests = resources.max_running_requests
+        self.max_req_len = resources.max_req_len
+        self.max_req_input_len = resources.max_req_input_len
+        self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
+        # Rebuild the cache view over the newly bound pools.  Retaining the old
+        # RadixCache here would silently allocate into another model's KV pool.
+        self.init_memory_pool_and_cache()
+        self.policy = SchedulePolicy(
+            self.schedule_policy,
+            self.tree_cache,
+            self.enable_hierarchical_cache,
+        )
+
+    def bind_uma_instance(self, recv_req: BindInstanceReq) -> UMAControlReqOutput:
+        identity = recv_req.identity
+        safe_point = self.reach_uma_safe_point()
+        if not safe_point.accepted:
+            return self._uma_output(
+                recv_req,
+                safe_point.code,
+                "; ".join(safe_point.reasons),
+            )
+        try:
+            target = self.tp_worker.get_uma_runtime(identity.instance_id)
+        except KeyError as exc:
+            return self._uma_output(
+                recv_req,
+                UMAControlCode.INSTANCE_NOT_REGISTERED,
+                str(exc),
+            )
+        if (
+            target.deployment_id != identity.deployment_id
+            or target.stage_id != identity.stage_id
+        ):
+            return self._uma_output(
+                recv_req,
+                UMAControlCode.MODEL_BIND_FAILURE,
+                "deployment or stage identity does not match registered runtime",
+            )
+        if target.weight_epoch != recv_req.expected_weight_epoch:
+            return self._uma_output(
+                recv_req,
+                UMAControlCode.STALE_RESOURCE_EPOCH,
+                f"registered weight epoch is {target.weight_epoch}",
+            )
+        if (
+            self.tokenizer is not None
+            and self._uma_active_instance_id != target.instance_id
+        ):
+            return self._uma_output(
+                recv_req,
+                UMAControlCode.MODEL_BIND_FAILURE,
+                "heterogeneous binding requires model-specific tokenization "
+                "outside the GPU worker",
+            )
+
+        old_instance_id = self._uma_active_instance_id
+        old_runtime = (
+            self.tp_worker.get_uma_runtime(old_instance_id)
+            if old_instance_id is not None
+            else None
+        )
+        if not self.flush_cache():
+            return self._uma_output(
+                recv_req,
+                UMAControlCode.PINNED_RESOURCE_CONFLICT,
+                "scheduler cache could not be flushed at the safe point",
+            )
+        result = self.tp_worker.bind_uma_runtime(
+            identity.instance_id,
+            placement_version=identity.placement_version,
+            resource_epoch=identity.resource_epoch,
+        )
+        if not result.accepted:
+            return self._uma_output(recv_req, result.code, result.reason)
+        try:
+            self._adopt_uma_runtime(target)
+        except BaseException as exc:
+            if old_runtime is not None:
+                rollback = self.tp_worker.bind_uma_runtime(
+                    old_runtime.instance_id,
+                    placement_version=old_runtime.placement_version,
+                    resource_epoch=old_runtime.resource_epoch,
+                )
+                if rollback.accepted:
+                    self._adopt_uma_runtime(old_runtime)
+            return self._uma_output(
+                recv_req,
+                UMAControlCode.MODEL_BIND_FAILURE,
+                f"scheduler binding failed and was rolled back: {exc}",
+            )
+        self._uma_active_instance_id = target.instance_id
+        return self._uma_output(recv_req, UMAControlCode.OK)
 
     def handle_generate_request(
         self,

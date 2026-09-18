@@ -735,6 +735,106 @@ class FlushCacheReqOutput:
     success: bool
 
 
+@dataclass(frozen=True, slots=True)
+class UMAResourceIdentity:
+    deployment_id: str
+    placement_version: int
+    instance_id: str
+    stage_id: str
+    resource_kind: str
+    resource_group_id_or_extent_id: str
+    optional_layer_or_block_range: Optional[tuple[int, int]]
+    resource_epoch: int
+    operation_id: str
+
+    def __post_init__(self):
+        for name in (
+            "deployment_id",
+            "instance_id",
+            "stage_id",
+            "resource_kind",
+            "resource_group_id_or_extent_id",
+            "operation_id",
+        ):
+            if not getattr(self, name).strip():
+                raise ValueError(f"{name} must not be empty")
+        if self.placement_version < 0 or self.resource_epoch < 0:
+            raise ValueError("placement and resource epochs must be non-negative")
+        if self.optional_layer_or_block_range is not None:
+            start, stop = self.optional_layer_or_block_range
+            if start < 0 or stop <= start:
+                raise ValueError("resource range must be a non-empty half-open range")
+
+
+@dataclass(frozen=True, slots=True)
+class RegisterModelAdapterReq:
+    identity: UMAResourceIdentity
+    model_path: str
+    checkpoint_digest: str
+    architecture: str
+    kv_layout: str
+    owns_input_embedding: bool
+    owns_final_norm: bool
+    owns_output_head: bool
+    group_layer_count: int = 1
+
+    def __post_init__(self):
+        for name in ("model_path", "checkpoint_digest", "architecture", "kv_layout"):
+            if not getattr(self, name).strip():
+                raise ValueError(f"{name} must not be empty")
+        if self.group_layer_count <= 0:
+            raise ValueError("group_layer_count must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class LoadWeightGroupReq:
+    identity: UMAResourceIdentity
+    final_bytes: int
+    staging_bytes: int
+
+    def __post_init__(self):
+        if self.final_bytes <= 0:
+            raise ValueError("final_bytes must be positive")
+        if self.staging_bytes < 0:
+            raise ValueError("staging_bytes must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class EvictWeightGroupReq:
+    identity: UMAResourceIdentity
+    expected_epoch: int
+
+    def __post_init__(self):
+        if self.expected_epoch < 0:
+            raise ValueError("expected_epoch must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class BindInstanceReq:
+    identity: UMAResourceIdentity
+    expected_weight_epoch: int
+
+    def __post_init__(self):
+        if self.expected_weight_epoch < 0:
+            raise ValueError("expected_weight_epoch must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class QuiesceInstanceReq:
+    identity: UMAResourceIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class UMAControlReqOutput:
+    success: bool
+    code: str
+    operation_id: str
+    instance_id: str
+    placement_version: int
+    resource_epoch: int
+    message: str = ""
+
+
 @dataclass
 class UpdateWeightFromDiskReqInput:
     # The model path with the new weights

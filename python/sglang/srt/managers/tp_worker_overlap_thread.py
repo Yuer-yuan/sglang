@@ -23,6 +23,7 @@ from typing import Optional, Tuple
 import psutil
 import torch
 
+from sglang.multi_model.uma.model_adapter import BoundModelRuntime
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -252,6 +253,33 @@ class TpModelWorkerClient:
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.worker.update_weights_from_disk(recv_req)
         return success, message
+
+    @property
+    def uma_in_flight_count(self) -> int:
+        return self.worker.uma_in_flight_count
+
+    def register_uma_runtime(
+        self,
+        runtime: BoundModelRuntime,
+        *,
+        replace: bool = False,
+    ) -> None:
+        self.worker.register_uma_runtime(runtime, replace=replace)
+
+    def get_uma_runtime(self, instance_id: str) -> BoundModelRuntime:
+        return self.worker.get_uma_runtime(instance_id)
+
+    def capture_current_uma_runtime(self, **identity) -> BoundModelRuntime:
+        return self.worker.capture_current_uma_runtime(**identity)
+
+    def bind_uma_runtime(self, instance_id: str, **identity):
+        return self.worker.bind_uma_runtime(instance_id, **identity)
+
+    def quiesce_uma_runtime(self):
+        return self.worker.quiesce_uma_runtime()
+
+    def resume_uma_runtime(self) -> None:
+        self.worker.resume_uma_runtime()
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.worker.init_weights_update_group(recv_req)
