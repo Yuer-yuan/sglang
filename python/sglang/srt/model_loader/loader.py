@@ -14,7 +14,17 @@ import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
+from typing import (
+    Any,
+    Collection,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    cast,
+)
 
 import huggingface_hub
 import numpy as np
@@ -26,6 +36,7 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
+from sglang.multi_model.uma.weight_plan import TensorExtent
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelConfig
@@ -388,6 +399,35 @@ class DefaultModelLoader(BaseModelLoader):
 
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+
+    def iter_named_tensors(
+        self,
+        source: "Source",
+        extents: Collection[TensorExtent],
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Read selected tensors without opening unrelated safetensor shards."""
+
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+        names_by_file: Dict[str, set[str]] = collections.defaultdict(set)
+        for extent in extents:
+            names_by_file[extent.file].add(extent.name)
+        disable_mmap = global_server_args_dict.get("weight_loader_disable_mmap")
+        for filename in sorted(names_by_file):
+            selected = names_by_file[filename]
+            observed: set[str] = set()
+            for name, tensor in safetensors_weights_iterator(
+                [filename],
+                disable_mmap=disable_mmap,
+            ):
+                if name in selected:
+                    observed.add(name)
+                    yield source.prefix + name, tensor
+            missing = selected - observed
+            if missing:
+                raise RuntimeError(
+                    f"selected tensors missing from {filename}: {sorted(missing)}"
+                )
 
     def _get_all_weights(
         self,
