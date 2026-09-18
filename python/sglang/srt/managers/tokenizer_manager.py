@@ -68,6 +68,7 @@ from sglang.srt.managers.io_struct import (
     BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
+    BindInstanceReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -91,6 +92,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    QuiesceInstanceReq,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -102,6 +104,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UMAControlReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -343,6 +346,9 @@ class TokenizerManager:
         self.update_lora_adapter_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.uma_control_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -412,6 +418,10 @@ class TokenizerManager:
                 (
                     LoRAUpdateResult,
                     self.update_lora_adapter_communicator.handle_recv,
+                ),
+                (
+                    UMAControlReqOutput,
+                    self.uma_control_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -964,6 +974,34 @@ class TokenizerManager:
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
             return all_success, all_message, all_paused_requests
+
+    async def bind_uma_instance(
+        self,
+        obj: BindInstanceReq,
+    ) -> UMAControlReqOutput:
+        """Bind one already registered runtime through the scheduler safe point."""
+
+        return await self._send_uma_control(obj)
+
+    async def quiesce_uma_instance(
+        self,
+        obj: QuiesceInstanceReq,
+    ) -> UMAControlReqOutput:
+        """Stop accepting forwards without choosing an eviction policy."""
+
+        return await self._send_uma_control(obj)
+
+    async def _send_uma_control(
+        self,
+        obj: Union[BindInstanceReq, QuiesceInstanceReq],
+    ) -> UMAControlReqOutput:
+        self.auto_create_handle_loop()
+        async with self.model_update_lock.writer_lock:
+            results = await self.uma_control_communicator(obj)
+        if not results:
+            raise RuntimeError("UMA control request returned no scheduler result")
+        failures = [result for result in results if not result.success]
+        return failures[0] if failures else results[0]
 
     async def init_weights_update_group(
         self,

@@ -66,6 +66,7 @@ from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    BindInstanceReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -76,6 +77,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     ProfileReqInput,
+    QuiesceInstanceReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SeparateReasoningReqInput,
@@ -491,6 +493,30 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
             content,
             status_code=HTTPStatus.BAD_REQUEST,
         )
+
+
+def _uma_control_response(result):
+    content = dataclasses.asdict(result)
+    return ORJSONResponse(
+        content,
+        status_code=HTTPStatus.OK if result.success else HTTPStatus.CONFLICT,
+    )
+
+
+@app.post("/uma/bind_instance")
+async def bind_uma_instance(obj: BindInstanceReq):
+    """Atomically bind a complete registered runtime at a scheduler safe point."""
+
+    result = await _global_state.tokenizer_manager.bind_uma_instance(obj)
+    return _uma_control_response(result)
+
+
+@app.post("/uma/quiesce_instance")
+async def quiesce_uma_instance(obj: QuiesceInstanceReq):
+    """Expose quiescence as a mechanism fact; this endpoint never drains work."""
+
+    result = await _global_state.tokenizer_manager.quiesce_uma_instance(obj)
+    return _uma_control_response(result)
 
 
 @app.post("/init_weights_update_group")
