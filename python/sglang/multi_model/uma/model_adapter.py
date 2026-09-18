@@ -172,6 +172,63 @@ class ModelAdapter(ABC):
         # not reliably hashable across PyTorch versions.
         return tuple(replacements.values())
 
+    def release_group(self, module: Any, group: WeightGroupSpec) -> int:
+        """Replace one group's physical parameters with aliased meta tensors."""
+        import torch
+
+        named = dict(module.named_parameters(remove_duplicate=False))
+        required_names = self.runtime_parameter_names(group)
+        missing = sorted(required_names - set(named))
+        if missing:
+            raise KeyError(
+                f"runtime parameters missing for {group.group_id}: {missing}"
+            )
+        selected_ids = {id(named[name]) for name in required_names}
+        resident_parameters = {
+            id(named[name]): named[name]
+            for name in required_names
+            if named[name].device.type != "meta"
+        }
+        released_bytes = sum(
+            parameter.numel() * parameter.element_size()
+            for parameter in resident_parameters.values()
+        )
+        replacements: dict[int, Any] = {}
+        for parameter_id, parameter in {
+            id(parameter): parameter
+            for parameter in named.values()
+            if id(parameter) in selected_ids
+        }.items():
+            if parameter.device.type == "meta":
+                replacements[parameter_id] = parameter
+            else:
+                tensor = torch.empty_like(parameter, device="meta")
+                replacement = torch.nn.Parameter(
+                    tensor,
+                    requires_grad=parameter.requires_grad,
+                )
+                replacement.__dict__.update(parameter.__dict__)
+                replacements[parameter_id] = replacement
+
+        # Build every replacement before changing module bindings.  A failed
+        # meta allocation therefore leaves the resident group intact.
+        for owner in module.modules():
+            for attribute, parameter in tuple(owner._parameters.items()):
+                if parameter is None or id(parameter) not in selected_ids:
+                    continue
+                owner._parameters[attribute] = replacements[id(parameter)]
+        return released_bytes
+
+    def group_is_meta(self, module: Any, group: WeightGroupSpec) -> bool:
+        named = dict(module.named_parameters(remove_duplicate=False))
+        names = self.runtime_parameter_names(group)
+        missing = sorted(names - set(named))
+        if missing:
+            raise KeyError(
+                f"runtime parameters missing for {group.group_id}: {missing}"
+            )
+        return all(named[name].device.type == "meta" for name in names)
+
     def load_group(
         self,
         module: Any,
