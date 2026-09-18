@@ -872,6 +872,11 @@ class UMAWeightReqOutput:
     resident_bytes: int = 0
     runtime_buffer_bytes: int = 0
     released_bytes: int = 0
+    allocator_allocated_bytes: int = 0
+    allocator_reserved_bytes: int = 0
+    process_rss_bytes: int = 0
+    process_anon_rss_bytes: int = 0
+    process_swap_bytes: int = 0
     weight_file_reads: int = 0
     message: str = ""
 

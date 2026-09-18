@@ -300,6 +300,14 @@ class TpModelWorkerClient:
     def uma_weight_file_reads(self) -> int:
         return self.worker.uma_weight_file_reads
 
+    @property
+    def uma_allocator_bytes(self) -> tuple[int, int]:
+        return self.worker.uma_allocator_bytes
+
+    @property
+    def uma_host_memory_snapshot(self) -> tuple[int, int, int]:
+        return self.worker.uma_host_memory_snapshot
+
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.worker.init_weights_update_group(recv_req)
         return success, message

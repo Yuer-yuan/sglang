@@ -3,12 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+import logging
 from pathlib import Path
 import threading
 from typing import Any, Iterable, Iterator, Protocol, Sequence
 
 from sglang.multi_model.uma.model_adapter import GroupValidation, ModelAdapter
 from sglang.multi_model.uma.weight_plan import TensorExtent, WeightGroupSpec
+
+
+logger = logging.getLogger(__name__)
 
 
 class WeightRuntimeError(RuntimeError):
@@ -355,8 +359,9 @@ class WeightRuntime:
         self._records: dict[Any, LoadedWeightGroup] = {}
         self._loading: set[tuple[str, str, int]] = set()
         self._lock = threading.RLock()
-        # CUDA allocator deltas are only attributable while materialization is
-        # serialized.  SSD prefetch may run in parallel before this section.
+        # Serialize our own materialization and eviction operations.  This does
+        # not make process-global CUDA allocator deltas perfectly attributable:
+        # unrelated request tensors can be finalized while an operation runs.
         self._allocation_lock = threading.Lock()
 
     def adopt_group(
@@ -465,15 +470,22 @@ class WeightRuntime:
                 allocated_after = self.allocator.allocated_bytes()
                 allocator_bytes = allocated_after - allocated_before
                 if allocator_bytes < validation.resident_bytes:
-                    raise WeightRuntimeError(
-                        f"weight group {group.group_id} allocator delta "
-                        f"{allocator_bytes} is below parameter bytes "
-                        f"{validation.resident_bytes}"
+                    logger.warning(
+                        "weight group %s allocator delta %d is below its "
+                        "validated parameter storage %d; unrelated live-runtime "
+                        "frees contaminated the process-global sample",
+                        group.group_id,
+                        allocator_bytes,
+                        validation.resident_bytes,
                     )
-                if allocator_bytes > reservation.final_bytes:
+                resident_bytes = max(
+                    validation.resident_bytes,
+                    allocator_bytes,
+                )
+                if resident_bytes > reservation.final_bytes:
                     raise WeightRuntimeError(
                         f"weight group {group.group_id} allocator uses "
-                        f"{allocator_bytes} bytes, reservation provides "
+                        f"{resident_bytes} bytes, reservation provides "
                         f"{reservation.final_bytes}"
                     )
             record = LoadedWeightGroup(
@@ -483,13 +495,13 @@ class WeightRuntime:
                 module=module,
                 state=WeightResidencyState.RESIDENT_EVICTABLE,
                 parameter_bytes=validation.resident_bytes,
-                resident_bytes=allocator_bytes,
+                resident_bytes=resident_bytes,
                 resource_epoch=self._resource_epoch(identity),
             )
             with self._lock:
                 self._records[identity] = record
                 try:
-                    reservation.commit(allocator_bytes)
+                    reservation.commit(resident_bytes)
                 except BaseException:
                     del self._records[identity]
                     raise
@@ -584,26 +596,36 @@ class WeightRuntime:
                 raise
             del self._records[record.identity]
             if parameter_bytes != record.parameter_bytes:
-                raise WeightRuntimeError(
-                    f"weight group {group_id} released {parameter_bytes} parameter "
-                    f"bytes, expected {record.parameter_bytes}"
+                logger.error(
+                    "weight group %s released %d validated parameter bytes, "
+                    "expected %d; storage is already absent",
+                    group_id,
+                    parameter_bytes,
+                    record.parameter_bytes,
                 )
             if released != record.resident_bytes:
-                raise WeightRuntimeError(
-                    f"weight group {group_id} returned {released} allocator bytes, "
-                    f"expected {record.resident_bytes}"
+                logger.warning(
+                    "weight group %s changed process-global allocator usage by "
+                    "%d bytes while its committed ledger charge is %d; "
+                    "unrelated live-runtime allocations contaminated the sample",
+                    group_id,
+                    released,
+                    record.resident_bytes,
                 )
-            return WeightRelease(
+            result = WeightRelease(
                 identity=record.identity,
                 group_id=group_id,
                 parameter_bytes=parameter_bytes,
-                released_bytes=released,
+                # Release exactly the charge committed by load_group.  The
+                # process-global allocator sample above is diagnostic only.
+                released_bytes=record.resident_bytes,
                 allocator_reserved_released_bytes=max(
                     0,
                     reserved_before - reserved_after,
                 ),
                 resource_epoch=record.resource_epoch,
             )
+            return result
 
     def resident_groups(self) -> tuple[LoadedWeightGroup, ...]:
         with self._lock:

@@ -267,6 +267,14 @@ class TpModelWorker:
     def uma_weight_file_reads(self) -> int:
         return self.model_runner.uma_weight_file_reads
 
+    @property
+    def uma_allocator_bytes(self) -> tuple[int, int]:
+        return self.model_runner.uma_allocator_bytes
+
+    @property
+    def uma_host_memory_snapshot(self) -> tuple[int, int, int]:
+        return self.model_runner.uma_host_memory_snapshot
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,

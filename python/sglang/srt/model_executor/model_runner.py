@@ -587,6 +587,30 @@ class ModelRunner:
     def uma_weight_file_reads(self) -> int:
         return self._uma_weight_reader.read_count
 
+    @property
+    def uma_allocator_bytes(self) -> tuple[int, int]:
+        """Return process-global CUDA allocator state for diagnostics."""
+
+        import torch
+
+        return (
+            torch.cuda.memory_allocated(self.device),
+            torch.cuda.memory_reserved(self.device),
+        )
+
+    @property
+    def uma_host_memory_snapshot(self) -> tuple[int, int, int]:
+        status = {}
+        for line in Path("/proc/self/status").read_text().splitlines():
+            name, value = line.split(":", 1)
+            if name in {"VmRSS", "RssAnon", "VmSwap"}:
+                status[name] = int(value.strip().split()[0]) * 1024
+        return (
+            status.get("VmRSS", 0),
+            status.get("RssAnon", 0),
+            status.get("VmSwap", 0),
+        )
+
     def _require_matching_uma_record(self, identity) -> ManagedModelRuntime:
         record = self._uma_managed_runtimes.require(identity.instance_id)
         if record.deployment_id != identity.deployment_id:

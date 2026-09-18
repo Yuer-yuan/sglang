@@ -1248,6 +1248,14 @@ class Scheduler(
             )
         )
         required = tuple(sorted(group.group_id for group in groups))
+        allocator_allocated, allocator_reserved = (
+            self.tp_worker.uma_allocator_bytes
+        )
+        (
+            process_rss_bytes,
+            process_anon_rss_bytes,
+            process_swap_bytes,
+        ) = self.tp_worker.uma_host_memory_snapshot
         return UMAWeightReqOutput(
             success=success,
             code=code,
@@ -1272,6 +1280,11 @@ class Scheduler(
                 item.runtime_buffer_bytes for item in records
             ),
             released_bytes=released_bytes,
+            allocator_allocated_bytes=allocator_allocated,
+            allocator_reserved_bytes=allocator_reserved,
+            process_rss_bytes=process_rss_bytes,
+            process_anon_rss_bytes=process_anon_rss_bytes,
+            process_swap_bytes=process_swap_bytes,
             weight_file_reads=self.tp_worker.uma_weight_file_reads,
             message=message,
         )

@@ -150,10 +150,20 @@ class Module:
 
 
 class Adapter:
-    def __init__(self, allocator, *, valid=True, allocator_bytes=16):
+    def __init__(
+        self,
+        allocator,
+        *,
+        valid=True,
+        allocator_bytes=16,
+        materialize_interference=0,
+        release_interference=0,
+    ):
         self.allocator = allocator
         self.valid = valid
         self.allocator_bytes = allocator_bytes
+        self.materialize_interference = materialize_interference
+        self.release_interference = release_interference
         self.releases = 0
 
     def group_storage_bytes(self, module, group):
@@ -165,7 +175,9 @@ class Adapter:
     def materialize_group(self, module, group, device):
         assert device == "cuda"
         module.materialized = True
-        self.allocator.allocated += self.allocator_bytes
+        self.allocator.allocated += (
+            self.allocator_bytes + self.materialize_interference
+        )
         self.allocator.reserved += 32
         return (object(),)
 
@@ -181,7 +193,9 @@ class Adapter:
     def release_group(self, module, group):
         assert module.materialized
         module.materialized = False
-        self.allocator.allocated -= self.allocator_bytes
+        self.allocator.allocated -= (
+            self.allocator_bytes + self.release_interference
+        )
         self.releases += 1
         return 16
 
@@ -215,11 +229,20 @@ def runtime():
     )
 
 
-def adapter(subject, *, valid=True, allocator_bytes=16):
+def adapter(
+    subject,
+    *,
+    valid=True,
+    allocator_bytes=16,
+    materialize_interference=0,
+    release_interference=0,
+):
     return Adapter(
         subject.allocator,
         valid=valid,
         allocator_bytes=allocator_bytes,
+        materialize_interference=materialize_interference,
+        release_interference=release_interference,
     )
 
 
@@ -235,6 +258,25 @@ def test_loading_uses_reserved_staging_and_publishes_after_validation():
     assert loaded.resident_bytes == 16
     assert reservation.committed == 16
     assert subject.reader.calls == [("layers-0-1", 16)]
+    assert subject.readiness("model-a") == frozenset({"layers-0-1"})
+
+
+def test_unrelated_free_does_not_reject_validated_group_load():
+    subject = runtime()
+    subject.allocator.allocated = 64
+    reservation = Reservation()
+
+    loaded = subject.load_group(
+        Identity(),
+        adapter(subject, materialize_interference=-32),
+        Module(),
+        group(),
+        reservation,
+    )
+
+    assert loaded.parameter_bytes == 16
+    assert loaded.resident_bytes == 16
+    assert reservation.committed == 16
     assert subject.readiness("model-a") == frozenset({"layers-0-1"})
 
 
@@ -275,6 +317,29 @@ def test_pinned_group_cannot_be_evicted():
     assert released.released_bytes == 16
     assert released.parameter_bytes == 16
     assert released.allocator_reserved_released_bytes == 32
+    assert subject.readiness("model-a") == frozenset()
+
+
+def test_allocator_noise_after_release_does_not_turn_eviction_into_failure():
+    subject = runtime()
+    module = Module()
+    loaded = subject.load_group(
+        Identity(),
+        adapter(subject, release_interference=5),
+        module,
+        group(),
+        Reservation(),
+    )
+    subject.allocator.allocated += 5
+
+    released = subject.evict_group(
+        "layers-0-1",
+        1,
+        instance_id="model-a",
+    )
+
+    assert not module.materialized
+    assert released.released_bytes == loaded.resident_bytes == 16
     assert subject.readiness("model-a") == frozenset()
 
 
