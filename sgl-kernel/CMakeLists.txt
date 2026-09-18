@@ -104,8 +104,8 @@ endif()
 option(ENABLE_BELOW_SM90 "Enable below SM90" ON)
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-    set(ENABLE_BELOW_SM90 OFF)
-    message(STATUS "For aarch64, disable gencode below SM90 by default")
+    set(ENABLE_BELOW_SM90 ON)
+    message(STATUS "For aarch64, enable gencode below SM90 by default")
 endif()
 
 include_directories(
@@ -124,7 +124,6 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-O3"
     "-Xcompiler"
     "-fPIC"
-    "-gencode=arch=compute_90,code=sm_90"
     "-std=c++17"
     "-DFLASHINFER_ENABLE_F16"
     "-DCUTE_USE_PACKED_TUPLE=1"
@@ -135,7 +134,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
-    "--threads=32"
+    "--threads=2"
 
     # Suppress warnings
     "-Xcompiler=-Wconversion"
@@ -155,13 +154,11 @@ option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 
 if (ENABLE_BELOW_SM90)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_75,code=sm_75"
-        "-gencode=arch=compute_80,code=sm_80"
-        "-gencode=arch=compute_89,code=sm_89"
+        "-gencode=arch=compute_87,code=sm_87"
     )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if (SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
         "-gencode=arch=compute_100a,code=sm_100a"
@@ -176,7 +173,7 @@ else()
     )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" OR SGL_KERNEL_ENABLE_SM90A)
+if (SGL_KERNEL_ENABLE_SM90A)
     set(SGL_KERNEL_ENABLE_FA3 ON)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
@@ -197,7 +194,7 @@ if (SGL_KERNEL_ENABLE_FP8)
     )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
+if (SGL_KERNEL_ENABLE_FP4)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DENABLE_NVFP4=1"
     )
@@ -226,11 +223,8 @@ set(SOURCES
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
-    "csrc/gemm/nvfp4_expert_quant.cu"
     "csrc/gemm/nvfp4_quant_entry.cu"
-    "csrc/gemm/nvfp4_quant_kernels.cu"
     "csrc/gemm/nvfp4_scaled_mm_entry.cu"
-    "csrc/gemm/nvfp4_scaled_mm_kernels.cu"
     "csrc/gemm/per_tensor_quant_fp8.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
@@ -337,7 +331,7 @@ if (SGL_KERNEL_ENABLE_FA3)
 
     if (ENABLE_BELOW_SM90)
         list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_80,code=sm_80"
+            "-gencode=arch=compute_87,code=sm_87"
             "-gencode=arch=compute_86,code=sm_86"
         )
         # SM8X Logic

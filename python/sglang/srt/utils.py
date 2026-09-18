@@ -83,12 +83,29 @@ from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
-from triton.runtime.cache import (
-    FileCacheManager,
-    default_cache_dir,
-    default_dump_dir,
-    default_override_dir,
-)
+try:
+    from triton.runtime.cache import (
+        FileCacheManager,
+        default_cache_dir,
+        default_dump_dir,
+        default_override_dir,
+    )
+except ImportError:
+    # Triton 3.6 removed these helpers while retaining FileCacheManager.
+    from triton.runtime.cache import FileCacheManager
+
+    def _triton_dir(kind):
+        root = os.path.expanduser(os.getenv("TRITON_HOME", "~/.triton"))
+        return os.path.join(root, kind)
+
+    def default_cache_dir():
+        return _triton_dir("cache")
+
+    def default_dump_dir():
+        return _triton_dir("dump")
+
+    def default_override_dir():
+        return _triton_dir("override")
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +233,9 @@ except:
 
 
 def cpu_has_amx_support():
-    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+    cpu_api = getattr(torch._C, "_cpu", None)
+    probe = getattr(cpu_api, "_is_amx_tile_supported", None)
+    return bool(probe and probe() and is_intel_amx_backend_available)
 
 
 def use_intel_amx_backend(layer):

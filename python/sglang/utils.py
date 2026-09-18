@@ -21,7 +21,17 @@ from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import requests
-from IPython.display import HTML, display
+try:
+    from IPython.display import HTML, display
+except ImportError:
+    # IPython is only needed by the notebook pretty-printer below.  Keeping it
+    # optional avoids pulling an interactive notebook stack into edge serving.
+    class HTML(str):
+        pass
+
+    def display(*_args, **_kwargs):
+        return None
+
 from pydantic import BaseModel
 from tqdm import tqdm
 
