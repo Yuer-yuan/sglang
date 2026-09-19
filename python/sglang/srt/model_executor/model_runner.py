@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -208,6 +209,10 @@ class ModelRunner:
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
+        self._uma_execution_slot_id = os.environ.get(
+            "DIST_EXECUTION_SLOT_ID", "slot-0"
+        )
+        self._uma_allocator_epoch = uuid.uuid4().hex
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
@@ -610,6 +615,10 @@ class ModelRunner:
             status.get("RssAnon", 0),
             status.get("VmSwap", 0),
         )
+
+    @property
+    def uma_memory_domain(self) -> tuple[str, str]:
+        return self._uma_execution_slot_id, self._uma_allocator_epoch
 
     def _require_matching_uma_record(self, identity) -> ManagedModelRuntime:
         record = self._uma_managed_runtimes.require(identity.instance_id)

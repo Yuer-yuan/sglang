@@ -866,12 +866,19 @@ class UMAWeightReqOutput:
     instance_id: str
     placement_version: int
     resource_epoch: int
+    execution_slot_id: str = ""
+    allocator_epoch: str = ""
     groups: tuple[UMAWeightGroupInfo, ...] = ()
     ready_weight_groups: tuple[str, ...] = ()
     required_weight_groups: tuple[str, ...] = ()
     resident_bytes: int = 0
     runtime_buffer_bytes: int = 0
     released_bytes: int = 0
+    logical_released_bytes: int = 0
+    allocator_released_bytes: int = 0
+    allocator_reserved_released_bytes: int = 0
+    backing_left_slot_ownership: bool = False
+    ownership_mechanism: str = ""
     allocator_allocated_bytes: int = 0
     allocator_reserved_bytes: int = 0
     process_rss_bytes: int = 0

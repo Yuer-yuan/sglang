@@ -200,9 +200,18 @@ class WeightRelease:
     identity: Any
     group_id: str
     parameter_bytes: int
-    released_bytes: int
+    logical_released_bytes: int
+    allocator_released_bytes: int
     allocator_reserved_released_bytes: int
+    backing_left_slot_ownership: bool
+    ownership_mechanism: str
     resource_epoch: int
+
+    @property
+    def released_bytes(self) -> int:
+        """Deprecated alias for the logical release dimension."""
+
+        return self.logical_released_bytes
 
 
 class PinnedWeightLease:
@@ -618,11 +627,16 @@ class WeightRuntime:
                 parameter_bytes=parameter_bytes,
                 # Release exactly the charge committed by load_group.  The
                 # process-global allocator sample above is diagnostic only.
-                released_bytes=record.resident_bytes,
+                logical_released_bytes=record.resident_bytes,
+                allocator_released_bytes=max(0, released),
                 allocator_reserved_released_bytes=max(
                     0,
                     reserved_before - reserved_after,
                 ),
+                # Releasing PyTorch storage and trimming its cache do not prove
+                # that Jetson backing pages left the CUDA context/driver domain.
+                backing_left_slot_ownership=False,
+                ownership_mechanism="torch-storage-release",
                 resource_epoch=record.resource_epoch,
             )
             return result

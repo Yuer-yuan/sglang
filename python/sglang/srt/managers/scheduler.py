@@ -1226,7 +1226,11 @@ class Scheduler(
         success: bool = True,
         code: str = "OK",
         resident_bytes: int = 0,
-        released_bytes: int = 0,
+        logical_released_bytes: int = 0,
+        allocator_released_bytes: int = 0,
+        allocator_reserved_released_bytes: int = 0,
+        backing_left_slot_ownership: bool = False,
+        ownership_mechanism: str = "",
         message: str = "",
     ) -> UMAWeightReqOutput:
         identity = getattr(recv_req, "identity", None)
@@ -1256,6 +1260,7 @@ class Scheduler(
             process_anon_rss_bytes,
             process_swap_bytes,
         ) = self.tp_worker.uma_host_memory_snapshot
+        execution_slot_id, allocator_epoch = self.tp_worker.uma_memory_domain
         return UMAWeightReqOutput(
             success=success,
             code=code,
@@ -1272,6 +1277,8 @@ class Scheduler(
             resource_epoch=(
                 identity.resource_epoch if identity is not None else 0
             ),
+            execution_slot_id=execution_slot_id,
+            allocator_epoch=allocator_epoch,
             groups=groups,
             ready_weight_groups=ready,
             required_weight_groups=required,
@@ -1279,7 +1286,14 @@ class Scheduler(
             runtime_buffer_bytes=sum(
                 item.runtime_buffer_bytes for item in records
             ),
-            released_bytes=released_bytes,
+            released_bytes=logical_released_bytes,
+            logical_released_bytes=logical_released_bytes,
+            allocator_released_bytes=allocator_released_bytes,
+            allocator_reserved_released_bytes=(
+                allocator_reserved_released_bytes
+            ),
+            backing_left_slot_ownership=backing_left_slot_ownership,
+            ownership_mechanism=ownership_mechanism,
             allocator_allocated_bytes=allocator_allocated,
             allocator_reserved_bytes=allocator_reserved,
             process_rss_bytes=process_rss_bytes,
@@ -1380,7 +1394,15 @@ class Scheduler(
                 recv_req,
                 action="EVICT_WEIGHT_GROUP",
                 record=record,
-                released_bytes=released.released_bytes,
+                logical_released_bytes=released.logical_released_bytes,
+                allocator_released_bytes=released.allocator_released_bytes,
+                allocator_reserved_released_bytes=(
+                    released.allocator_reserved_released_bytes
+                ),
+                backing_left_slot_ownership=(
+                    released.backing_left_slot_ownership
+                ),
+                ownership_mechanism=released.ownership_mechanism,
             )
         except Exception as exc:
             message = str(exc)

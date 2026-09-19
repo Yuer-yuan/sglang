@@ -127,3 +127,28 @@ def test_http_server_declares_both_uma_control_routes():
 
     assert "/uma/bind_instance" in routes
     assert "/uma/quiesce_instance" in routes
+
+
+def test_uma_response_separates_allocator_domain_and_release_dimensions():
+    response = io_struct.UMAWeightReqOutput(
+        success=True,
+        code="OK",
+        action="EVICT_WEIGHT_GROUP",
+        operation_id="evict-a",
+        instance_id="model-a",
+        placement_version=3,
+        resource_epoch=7,
+        execution_slot_id="slot-0",
+        allocator_epoch="context-123",
+        released_bytes=16,
+        logical_released_bytes=16,
+        allocator_released_bytes=12,
+        allocator_reserved_released_bytes=32,
+        backing_left_slot_ownership=False,
+        ownership_mechanism="torch-storage-release",
+    )
+
+    assert response.execution_slot_id == "slot-0"
+    assert response.allocator_epoch == "context-123"
+    assert response.released_bytes == response.logical_released_bytes == 16
+    assert not response.backing_left_slot_ownership

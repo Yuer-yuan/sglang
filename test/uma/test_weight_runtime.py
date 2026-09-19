@@ -315,8 +315,12 @@ def test_pinned_group_cannot_be_evicted():
     )
     released = subject.evict_group("layers-0-1", 1, instance_id="model-a")
     assert released.released_bytes == 16
+    assert released.logical_released_bytes == 16
+    assert released.allocator_released_bytes == 16
     assert released.parameter_bytes == 16
     assert released.allocator_reserved_released_bytes == 32
+    assert released.backing_left_slot_ownership is False
+    assert released.ownership_mechanism == "torch-storage-release"
     assert subject.readiness("model-a") == frozenset()
 
 
@@ -340,6 +344,9 @@ def test_allocator_noise_after_release_does_not_turn_eviction_into_failure():
 
     assert not module.materialized
     assert released.released_bytes == loaded.resident_bytes == 16
+    assert released.logical_released_bytes == 16
+    assert released.allocator_released_bytes == 21
+    assert released.backing_left_slot_ownership is False
     assert subject.readiness("model-a") == frozenset()
 
 

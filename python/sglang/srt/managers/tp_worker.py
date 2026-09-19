@@ -275,6 +275,10 @@ class TpModelWorker:
     def uma_host_memory_snapshot(self) -> tuple[int, int, int]:
         return self.model_runner.uma_host_memory_snapshot
 
+    @property
+    def uma_memory_domain(self) -> tuple[str, str]:
+        return self.model_runner.uma_memory_domain
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,

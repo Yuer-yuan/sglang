@@ -308,6 +308,10 @@ class TpModelWorkerClient:
     def uma_host_memory_snapshot(self) -> tuple[int, int, int]:
         return self.worker.uma_host_memory_snapshot
 
+    @property
+    def uma_memory_domain(self) -> tuple[str, str]:
+        return self.worker.uma_memory_domain
+
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.worker.init_weights_update_group(recv_req)
         return success, message
