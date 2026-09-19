@@ -109,6 +109,7 @@ class RadixCache(BasePrefixCache):
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
+        self.uma_session_kv_observer = None
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -210,9 +211,116 @@ class RadixCache(BasePrefixCache):
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
 
+        # The request-pool row is released immediately below and may be reused
+        # by another request.  Capture the canonical RadixCache mapping here,
+        # after duplicate insertion indices have been freed but before the row
+        # disappears.  Durable session KV must never reconstruct this mapping
+        # later from a stale request-pool slot.
+        if self.uma_session_kv_observer is not None and req.session_id is not None:
+            canonical = self.match_prefix(token_ids[:page_aligned_len]).device_indices
+            if len(canonical) != page_aligned_len:
+                raise RuntimeError("finished session KV was not fully published")
+            self.uma_session_kv_observer(
+                req,
+                tuple(token_ids[:page_aligned_len]),
+                tuple(int(item) for item in canonical.to("cpu").tolist()),
+            )
+
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
+
+    def set_uma_session_kv_observer(self, observer) -> None:
+        """Install the scheduler-owned branch catalog callback."""
+
+        self.uma_session_kv_observer = observer
+
+    def detach_uma_branch(
+        self,
+        token_ids: tuple[int, ...],
+        expected_indices: tuple[int, ...],
+        exclusive_indices: tuple[int, ...],
+    ) -> None:
+        """Remove one branch's exclusive suffix without freeing its indices.
+
+        Radix sharing is prefix-shaped, so indices exclusively owned by one
+        completed branch must be one contiguous suffix.  The allocator release
+        remains a separate transaction step performed only after this method.
+        """
+
+        if self.disable:
+            raise RuntimeError("durable session KV requires RadixCache")
+        key = list(token_ids)
+        matched = self.match_prefix(key)
+        observed = tuple(
+            int(item) for item in matched.device_indices.to("cpu").tolist()
+        )
+        if observed != expected_indices:
+            raise RuntimeError("RadixCache branch mapping changed before offload")
+        if not exclusive_indices:
+            return
+        exclusive = set(exclusive_indices)
+        positions = [
+            index for index, value in enumerate(expected_indices) if value in exclusive
+        ]
+        first = positions[0]
+        if (
+            positions != list(range(first, len(expected_indices)))
+            or set(expected_indices[first:]) != exclusive
+        ):
+            raise RuntimeError("exclusive KV ownership is not a RadixCache suffix")
+
+        boundary = (
+            self.root_node
+            if first == 0
+            else self.match_prefix(key[:first]).last_device_node
+        )
+        target = self.match_prefix(key).last_device_node
+        removal_path = []
+        cursor = target
+        child_on_path = None
+        while cursor is not boundary:
+            extra_children = [
+                child
+                for child in cursor.children.values()
+                if child is not child_on_path
+            ]
+            if extra_children:
+                raise RuntimeError("cannot detach a KV suffix with live descendants")
+            if cursor.lock_ref:
+                raise RuntimeError("cannot detach a locked RadixCache node")
+            removal_path.append(cursor)
+            child_on_path = cursor
+            cursor = cursor.parent
+        # Mutate only after the whole path has passed validation; a rejected
+        # ownership claim must leave the prefix tree untouched.
+        for node in removal_path:
+            self._record_remove_event(node)
+            self._delete_leaf(node)
+
+    def publish_uma_branch(
+        self,
+        token_ids: tuple[int, ...],
+        kv_indices: tuple[int, ...],
+    ) -> None:
+        """Atomically publish a fully restored branch at a scheduler safe point."""
+
+        if self.disable:
+            raise RuntimeError("durable session KV requires RadixCache")
+        key = list(token_ids)
+        current = self.match_prefix(key).device_indices
+        prefix_len = len(current)
+        current_indices = tuple(int(item) for item in current.to("cpu").tolist())
+        if current_indices != kv_indices[:prefix_len]:
+            raise RuntimeError("restored branch conflicts with an existing prefix")
+        value = torch.tensor(kv_indices, dtype=torch.int64, device=self.device)
+        matched = self.insert(key, value)
+        if matched != prefix_len:
+            raise RuntimeError("RadixCache publication matched an unexpected prefix")
+        published = self.match_prefix(key).device_indices
+        observed = tuple(int(item) for item in published.to("cpu").tolist())
+        if observed != kv_indices:
+            raise RuntimeError("RadixCache did not publish the restored mapping")
 
     def cache_unfinished_req(self, req: Req):
         """Cache request when it is unfinished."""

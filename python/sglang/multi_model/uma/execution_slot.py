@@ -59,7 +59,7 @@ def assess_scheduler_safe_point(
     waiting_count: int,
     running_counts: Sequence[int],
     grammar_count: int,
-    session_count: int,
+    non_durable_session_kv_count: int,
     has_chunked_request: bool,
     overlap_enabled: bool,
     overlap_result_count: int,
@@ -80,8 +80,11 @@ def assess_scheduler_safe_point(
         reasons.append(f"{running} running request(s)")
     if grammar_count:
         reasons.append(f"{grammar_count} grammar request(s)")
-    if session_count:
-        reasons.append(f"{session_count} session(s) still attached")
+    if non_durable_session_kv_count:
+        reasons.append(
+            f"{non_durable_session_kv_count} session KV branch(es) are not "
+            "durably offloaded"
+        )
     if has_chunked_request:
         reasons.append("chunked prefill is active")
     if overlap_enabled:

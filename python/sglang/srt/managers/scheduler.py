@@ -39,6 +39,18 @@ from sglang.multi_model.uma.execution_slot import (
     UMAControlCode,
     assess_scheduler_safe_point,
 )
+from sglang.multi_model.uma.kv_domain import (
+    SessionBranchKey,
+    SessionKVDescriptor,
+)
+from sglang.multi_model.uma.kv_residency import (
+    KVOffloadCommand,
+    KVResidencyResult,
+    KVResidencyRuntime,
+    KVRestoreCommand,
+    RestorePolicy,
+)
+from sglang.multi_model.uma.local_kv_store import LocalKVStore
 from sglang.multi_model.uma.model_adapter import BoundModelRuntime
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
@@ -80,6 +92,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetUMAKVSnapshotReq,
     GetUMAWeightSnapshotReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -88,12 +101,15 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    KVResidencyReqOutput,
+    KVResidencySnapshotOutput,
     EvictWeightGroupReq,
     LoadWeightGroupReq,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
+    OffloadKVRangeReq,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -103,6 +119,7 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    RestoreKVRangeReq,
     RpcReqInput,
     RpcReqOutput,
     SetInternalStateReq,
@@ -178,6 +195,19 @@ from sglang.srt.utils import (
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedSessionKV:
+    deployment_id: str
+    placement_version: int
+    instance_id: str
+    stage_id: str
+    model_digest: str
+    predecessor_request_id: Optional[str]
+    token_ids: tuple[int, ...]
+    kv_indices: tuple[int, ...]
+
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
@@ -504,6 +534,10 @@ class Scheduler(
         self.init_kv_events(server_args.kv_events_config)
         self._uma_bootstrap_registered = False
         self._uma_active_instance_id: Optional[str] = None
+        self._uma_kv_runtimes: dict[str, KVResidencyRuntime] = {}
+        self._uma_captured_session_kv: dict[
+            tuple[str, str, str], _CapturedSessionKV
+        ] = {}
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -521,6 +555,9 @@ class Scheduler(
                 (LoadWeightGroupReq, self.load_uma_weight_group),
                 (EvictWeightGroupReq, self.evict_uma_weight_group),
                 (GetUMAWeightSnapshotReq, self.get_uma_weight_snapshot),
+                (OffloadKVRangeReq, self.offload_uma_kv_range),
+                (RestoreKVRangeReq, self.restore_uma_kv_range),
+                (GetUMAKVSnapshotReq, self.get_uma_kv_snapshot),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
                 (
@@ -1114,6 +1151,7 @@ class Scheduler(
                 raise RuntimeError(f"failed to register bootstrap runtime: {result}")
             self._uma_active_instance_id = bootstrap.instance_id
             self._uma_bootstrap_registered = True
+            self._configure_uma_kv_runtime(bootstrap)
         self.tp_worker.register_uma_runtime(runtime, replace=replace)
 
     def reach_uma_safe_point(self) -> SafePointResult:
@@ -1125,11 +1163,301 @@ class Scheduler(
             waiting_count=len(self.waiting_queue),
             running_counts=running_counts,
             grammar_count=len(self.grammar_queue),
-            session_count=len(self.sessions),
+            # Session control objects may outlive model residency.  Only a
+            # captured branch whose KV has no committed SSD authority blocks
+            # cache teardown and ExecutionSlot rebinding.
+            non_durable_session_kv_count=(self._uma_non_durable_session_kv_count()),
             has_chunked_request=self.chunked_req is not None,
             overlap_enabled=self.enable_overlap,
             overlap_result_count=len(getattr(self, "result_queue", ())),
             worker_in_flight_count=self.tp_worker.uma_in_flight_count,
+        )
+
+    def reach_uma_kv_safe_point(self) -> SafePointResult:
+        """A KV operation may retain idle sessions but never in-flight work."""
+
+        if hasattr(self, "running_mbs"):
+            running_counts = tuple(len(batch.reqs) for batch in self.running_mbs)
+        else:
+            running_counts = (len(self.running_batch.reqs),)
+        return assess_scheduler_safe_point(
+            waiting_count=len(self.waiting_queue),
+            running_counts=running_counts,
+            grammar_count=len(self.grammar_queue),
+            # Sessions are the object being persisted.  Their control metadata
+            # stays attached while their KV becomes non-resident.
+            non_durable_session_kv_count=0,
+            has_chunked_request=self.chunked_req is not None,
+            overlap_enabled=self.enable_overlap,
+            overlap_result_count=len(getattr(self, "result_queue", ())),
+            worker_in_flight_count=self.tp_worker.uma_in_flight_count,
+        )
+
+    def _uma_non_durable_session_kv_count(self) -> int:
+        instance_id = self._uma_active_instance_id
+        if instance_id is None:
+            return 0
+        runtime = self._uma_kv_runtimes.get(instance_id)
+        blockers = 0
+        for (
+            captured_instance_id,
+            session_id,
+            request_id,
+        ), captured in self._uma_captured_session_kv.items():
+            if captured_instance_id != instance_id:
+                continue
+            key = SessionBranchKey(
+                instance_id,
+                captured.stage_id,
+                session_id,
+                request_id,
+            )
+            if runtime is None or not runtime.is_durably_offloaded(key):
+                blockers += 1
+        return blockers
+
+    def _configure_uma_kv_runtime(self, runtime: BoundModelRuntime) -> None:
+        if not hasattr(self.tree_cache, "set_uma_session_kv_observer"):
+            return
+        adapter = self.tp_worker.create_uma_kv_residency_adapter(self.tree_cache)
+        kv_runtime = self._uma_kv_runtimes.get(runtime.instance_id)
+        if kv_runtime is None:
+            root = Path(os.getenv("SGLANG_UMA_KV_STORE", "/tmp/sglang-uma-kv"))
+            safe_instance = "".join(
+                char if char.isalnum() or char in "-_." else "_"
+                for char in runtime.instance_id
+            )
+            store = LocalKVStore(
+                root / safe_instance / f"pp-{self.pp_rank}-tp-{self.tp_rank}"
+            )
+            kv_runtime = KVResidencyRuntime(store=store, adapter=adapter)
+            self._uma_kv_runtimes[runtime.instance_id] = kv_runtime
+        else:
+            # Rebinding rebuilds the scheduler's RadixCache view over the same
+            # model-owned pool.  Durable records survive; only the adapter's
+            # live cache view changes.
+            kv_runtime.adapter = adapter
+
+        def capture(req, token_ids, kv_indices) -> None:
+            key = (runtime.instance_id, req.session_id, req.rid)
+            self._uma_captured_session_kv[key] = _CapturedSessionKV(
+                deployment_id=runtime.deployment_id,
+                placement_version=runtime.placement_version,
+                instance_id=runtime.instance_id,
+                stage_id=runtime.stage_id,
+                model_digest=runtime.model_digest,
+                predecessor_request_id=getattr(req, "uma_predecessor_request_id", None),
+                token_ids=token_ids,
+                kv_indices=kv_indices,
+            )
+
+        self.tree_cache.set_uma_session_kv_observer(capture)
+
+    def _materialize_uma_kv_branch(self, recv_req) -> KVResidencyRuntime:
+        target = recv_req.target
+        resource = target.resource
+        if resource.resource_kind != "KV":
+            raise ValueError("resource_kind must be KV")
+        if resource.resource_epoch != target.kv_epoch:
+            raise ValueError("resource and KV epochs disagree")
+        if recv_req.expected_epoch != target.kv_epoch:
+            raise ValueError("expected KV epoch is stale")
+        if target.layer_range != resource.layer_range:
+            raise ValueError("resource and KV layer ranges disagree")
+        if self._uma_active_instance_id != resource.instance_id:
+            raise ValueError("target model instance is not bound")
+        runtime = self.tp_worker.get_uma_runtime(resource.instance_id)
+        if (
+            runtime.deployment_id != resource.deployment_id
+            or runtime.placement_version != resource.placement_version
+            or runtime.stage_id != resource.stage_id
+            or runtime.model_digest != target.model_digest
+        ):
+            raise ValueError("KV identity does not match the bound model stage")
+        local_range = (
+            runtime.execution_resources.start_layer,
+            runtime.execution_resources.end_layer,
+        )
+        if target.layer_range != local_range:
+            raise ValueError(
+                f"full-barrier KV range must cover local layers {local_range}"
+            )
+        try:
+            kv_runtime = self._uma_kv_runtimes[resource.instance_id]
+        except KeyError as exc:
+            raise ValueError("bound model has no KV residency runtime") from exc
+        captured_key = (
+            resource.instance_id,
+            target.session_id,
+            target.request_id,
+        )
+        try:
+            selected = self._uma_captured_session_kv[captured_key]
+        except KeyError as exc:
+            raise ValueError("session branch has no captured resident KV") from exc
+        expected_token_range = (0, len(selected.token_ids))
+        if target.token_range != expected_token_range:
+            raise ValueError(f"full-branch token range must be {expected_token_range}")
+        expected_bytes = len(selected.kv_indices) * kv_runtime.adapter.bytes_per_index
+        requested_bytes = getattr(recv_req, "ssd_final_bytes", expected_bytes)
+        if requested_bytes != expected_bytes:
+            raise ValueError(
+                f"KV byte estimate {requested_bytes} does not match {expected_bytes}"
+            )
+
+        # Attach all captured branches from this conversation so the registry
+        # can distinguish true exclusive suffix pages from shared prefixes.
+        for (instance_id, session_id, request_id), captured in sorted(
+            self._uma_captured_session_kv.items()
+        ):
+            if instance_id != resource.instance_id or session_id != target.session_id:
+                continue
+            key = SessionBranchKey(
+                instance_id,
+                captured.stage_id,
+                session_id,
+                request_id,
+            )
+            try:
+                kv_runtime.descriptor(key)
+                continue
+            except KeyError:
+                pass
+            kv_runtime.attach_resident(
+                SessionKVDescriptor(
+                    key=key,
+                    predecessor_request_id=captured.predecessor_request_id,
+                    instance_id=instance_id,
+                    model_digest=captured.model_digest,
+                    placement_version=captured.placement_version,
+                    stage_id=captured.stage_id,
+                    kv_epoch=target.kv_epoch,
+                    token_ids=captured.token_ids,
+                    kv_indices=captured.kv_indices,
+                    token_position=len(captured.token_ids),
+                    logical_bytes=len(captured.kv_indices)
+                    * kv_runtime.adapter.bytes_per_index,
+                )
+            )
+        return kv_runtime
+
+    @staticmethod
+    def _uma_kv_output(result: KVResidencyResult) -> KVResidencyReqOutput:
+        return KVResidencyReqOutput(
+            code=result.code,
+            reason=result.reason,
+            resource_epoch=result.resource_epoch,
+            committed_ssd_bytes=result.committed_ssd_bytes,
+            resident_bytes=result.resident_bytes,
+            allocator_resident_bytes=result.allocator_resident_bytes,
+            logical_released_bytes=result.logical_released_bytes,
+            allocator_released_bytes=result.allocator_released_bytes,
+            released_physical_bytes=result.released_physical_bytes,
+            post_release_ownership=result.post_release_ownership,
+            backing_left_slot_ownership=result.backing_left_slot_ownership,
+            ownership_mechanism=result.ownership_mechanism,
+        )
+
+    @staticmethod
+    def _uma_kv_failure(recv_req, code: str, reason: str) -> KVResidencyReqOutput:
+        return KVResidencyReqOutput(
+            code=code,
+            reason=reason,
+            resource_epoch=recv_req.expected_epoch,
+            committed_ssd_bytes=0,
+            resident_bytes=0,
+            allocator_resident_bytes=0,
+            logical_released_bytes=0,
+            allocator_released_bytes=0,
+            released_physical_bytes=0,
+            post_release_ownership="UNATTRIBUTED",
+            backing_left_slot_ownership=False,
+            ownership_mechanism="",
+        )
+
+    def offload_uma_kv_range(self, recv_req: OffloadKVRangeReq) -> KVResidencyReqOutput:
+        safe_point = self.reach_uma_kv_safe_point()
+        if not safe_point.accepted:
+            return self._uma_kv_failure(
+                recv_req,
+                safe_point.code.value,
+                "; ".join(safe_point.reasons),
+            )
+        try:
+            runtime = self._materialize_uma_kv_branch(recv_req)
+            target = recv_req.target
+            result = runtime.offload(
+                KVOffloadCommand(
+                    key=SessionBranchKey(
+                        target.resource.instance_id,
+                        target.resource.stage_id,
+                        target.session_id,
+                        target.request_id,
+                    ),
+                    expected_kv_epoch=recv_req.expected_epoch,
+                    operation_id=recv_req.operation_id,
+                    layer_ranges=tuple(
+                        (layer_id, layer_id + 1)
+                        for layer_id in range(*target.layer_range)
+                    ),
+                )
+            )
+            return self._uma_kv_output(result)
+        except Exception as exc:
+            return self._uma_kv_failure(recv_req, "KV_OFFLOAD_FAILURE", str(exc))
+
+    def restore_uma_kv_range(self, recv_req: RestoreKVRangeReq) -> KVResidencyReqOutput:
+        safe_point = self.reach_uma_kv_safe_point()
+        if not safe_point.accepted:
+            return self._uma_kv_failure(
+                recv_req,
+                safe_point.code.value,
+                "; ".join(safe_point.reasons),
+            )
+        try:
+            target = recv_req.target
+            if self._uma_active_instance_id != target.resource.instance_id:
+                raise ValueError("target model instance is not bound")
+            runtime = self._uma_kv_runtimes[target.resource.instance_id]
+            result = runtime.restore(
+                KVRestoreCommand(
+                    key=SessionBranchKey(
+                        target.resource.instance_id,
+                        target.resource.stage_id,
+                        target.session_id,
+                        target.request_id,
+                    ),
+                    expected_kv_epoch=recv_req.expected_epoch,
+                    operation_id=recv_req.operation_id,
+                    policy=RestorePolicy(recv_req.policy),
+                )
+            )
+            return self._uma_kv_output(result)
+        except Exception as exc:
+            return self._uma_kv_failure(recv_req, "KV_RESTORE_FAILURE", str(exc))
+
+    def get_uma_kv_snapshot(
+        self, recv_req: GetUMAKVSnapshotReq
+    ) -> KVResidencySnapshotOutput:
+        execution_slot_id, allocator_epoch = self.tp_worker.uma_memory_domain
+        ranges = tuple(
+            {
+                "instance_id": item.descriptor.instance_id,
+                "stage_id": item.descriptor.stage_id,
+                "session_id": item.descriptor.key.session_id,
+                "request_id": item.descriptor.key.request_id,
+                "kv_epoch": item.descriptor.kv_epoch,
+                "state": item.state,
+                "logical_bytes": item.descriptor.logical_bytes,
+                "committed_ssd_bytes": item.committed_ssd_bytes,
+            }
+            for runtime in self._uma_kv_runtimes.values()
+            for item in runtime.snapshots()
+        )
+        return KVResidencySnapshotOutput(
+            execution_slot_id=execution_slot_id,
+            allocator_epoch=allocator_epoch,
+            ranges=ranges,
         )
 
     @staticmethod
@@ -1447,6 +1775,7 @@ class Scheduler(
             self.tree_cache,
             self.enable_hierarchical_cache,
         )
+        self._configure_uma_kv_runtime(runtime)
 
     def bind_uma_instance(self, recv_req: BindInstanceReq) -> UMAControlReqOutput:
         identity = recv_req.identity

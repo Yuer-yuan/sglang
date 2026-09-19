@@ -72,6 +72,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     EvictWeightGroupReq,
     GenerateReqInput,
+    OffloadKVRangeReq,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadWeightGroupReq,
@@ -83,6 +84,7 @@ from sglang.srt.managers.io_struct import (
     RegisterModelAdapterReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    RestoreKVRangeReq,
     SeparateReasoningReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
@@ -553,6 +555,26 @@ async def evict_uma_weight_group(obj: EvictWeightGroupReq):
 async def get_uma_weight_snapshot():
     result = await _global_state.tokenizer_manager.get_uma_weight_snapshot()
     return _uma_control_response(result)
+
+
+@app.post("/uma/offload_kv_range")
+async def offload_uma_kv_range(obj: OffloadKVRangeReq):
+    result = await _global_state.tokenizer_manager.offload_uma_kv_range(obj)
+    # Mechanism failures are structured scheduler outcomes, not transport
+    # failures; the Node Agent must always receive the exact result contract.
+    return ORJSONResponse(dataclasses.asdict(result), status_code=HTTPStatus.OK)
+
+
+@app.post("/uma/restore_kv_range")
+async def restore_uma_kv_range(obj: RestoreKVRangeReq):
+    result = await _global_state.tokenizer_manager.restore_uma_kv_range(obj)
+    return ORJSONResponse(dataclasses.asdict(result), status_code=HTTPStatus.OK)
+
+
+@app.get("/uma/kv_snapshot")
+async def get_uma_kv_snapshot():
+    result = await _global_state.tokenizer_manager.get_uma_kv_snapshot()
+    return ORJSONResponse(dataclasses.asdict(result), status_code=HTTPStatus.OK)
 
 
 @app.post("/init_weights_update_group")

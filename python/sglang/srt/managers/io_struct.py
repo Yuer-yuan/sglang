@@ -897,6 +897,85 @@ class GetUMAWeightSnapshotReq:
             raise ValueError("operation_id must not be empty")
 
 
+@dataclass(frozen=True, slots=True)
+class UMAKVResourceIdentity:
+    deployment_id: str
+    placement_version: int
+    instance_id: str
+    stage_id: str
+    resource_kind: str
+    extent_id: str
+    layer_range: tuple[int, int]
+    resource_epoch: int
+    operation_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class UMAKVRangeIdentity:
+    resource: UMAKVResourceIdentity
+    model_digest: str
+    session_id: str
+    request_id: str
+    kv_epoch: int
+    token_range: tuple[int, int]
+    layer_range: tuple[int, int]
+    kv_layout: str
+    dtype: str
+    shapes: tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OffloadKVRangeReq:
+    operation_id: str
+    target: UMAKVRangeIdentity
+    expected_epoch: int
+    staging_bytes: int
+    ssd_final_bytes: int
+    ssd_transient_bytes: int
+    io_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreKVRangeReq:
+    operation_id: str
+    target: UMAKVRangeIdentity
+    expected_epoch: int
+    memory_final_bytes: int
+    staging_bytes: int
+    io_tokens: int
+    policy: str = "FULL_BARRIER"
+
+
+@dataclass(frozen=True, slots=True)
+class GetUMAKVSnapshotReq:
+    operation_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class KVResidencyReqOutput:
+    """Strict wire contract consumed by the Dist Node Agent."""
+
+    code: str
+    reason: str
+    resource_epoch: int
+    committed_ssd_bytes: int
+    resident_bytes: int
+    allocator_resident_bytes: int
+    logical_released_bytes: int
+    allocator_released_bytes: int
+    released_physical_bytes: int
+    post_release_ownership: str
+    backing_left_slot_ownership: bool
+    ownership_mechanism: str
+
+
+@dataclass(frozen=True, slots=True)
+class KVResidencySnapshotOutput:
+    execution_slot_id: str
+    allocator_epoch: str
+    ranges: tuple[dict[str, object], ...]
+
+
 @dataclass
 class UpdateWeightFromDiskReqInput:
     # The model path with the new weights

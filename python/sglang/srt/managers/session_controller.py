@@ -145,6 +145,11 @@ class Session:
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
         )
+        # Stable branch identity for durable KV.  ``session_id`` alone is not
+        # unique once a conversation forks or replaces a prior turn.
+        new_req.uma_predecessor_request_id = (
+            last_req.rid if last_req is not None else None
+        )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
         new_req.tokenizer = tokenizer

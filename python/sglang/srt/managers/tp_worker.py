@@ -21,6 +21,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.multi_model.uma.execution_slot import RuntimeBindResult, SafePointResult
+from sglang.multi_model.uma.kv_residency import SGLangKVResidencyAdapter
 from sglang.multi_model.uma.model_adapter import BoundModelRuntime
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -193,6 +194,14 @@ class TpModelWorker:
         return (
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool_allocator,
+        )
+
+    def create_uma_kv_residency_adapter(self, tree_cache):
+        """Expose worker-owned tensor/allocator semantics to the scheduler."""
+
+        return SGLangKVResidencyAdapter(
+            self.model_runner.token_to_kv_pool_allocator,
+            tree_cache,
         )
 
     @property

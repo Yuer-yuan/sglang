@@ -307,6 +307,7 @@ class ModelRunner:
         stage_id: str,
         resource_epoch: int,
         weight_epoch: int,
+        model_digest: Optional[str] = None,
         kv_layout: Optional[str] = None,
     ) -> BoundModelRuntime:
         """Capture the currently bound complete runner state for rollback.
@@ -346,6 +347,7 @@ class ModelRunner:
             instance_id=instance_id,
             stage_id=stage_id,
             resource_epoch=resource_epoch,
+            model_digest=model_digest or f"bootstrap:{instance_id}",
             model_config=self.model_config,
             module=self.model,
             kv_layout=kv_layout

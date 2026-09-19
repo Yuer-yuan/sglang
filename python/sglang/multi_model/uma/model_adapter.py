@@ -241,6 +241,7 @@ class BoundModelRuntime:
     instance_id: str
     stage_id: str
     resource_epoch: int
+    model_digest: str
     model_config: Any
     module: Any
     kv_layout: str
@@ -250,7 +251,13 @@ class BoundModelRuntime:
     execution_resources: ExecutionResourceBundle
 
     def validate_complete(self) -> None:
-        for name in ("deployment_id", "instance_id", "stage_id", "kv_layout"):
+        for name in (
+            "deployment_id",
+            "instance_id",
+            "stage_id",
+            "model_digest",
+            "kv_layout",
+        ):
             if not str(getattr(self, name)).strip():
                 raise ValueError(f"{name} must not be empty")
         if self.placement_version < 0 or self.resource_epoch < 0:
@@ -621,6 +628,7 @@ class ModelAdapter(ABC):
         instance_id: str,
         stage_id: str,
         resource_epoch: int,
+        model_digest: str,
         module: Any,
         plan: WeightPlan,
         ready_groups: Sequence[str],
@@ -640,6 +648,7 @@ class ModelAdapter(ABC):
             instance_id=instance_id,
             stage_id=stage_id,
             resource_epoch=resource_epoch,
+            model_digest=model_digest,
             model_config=self.model_config,
             module=module,
             kv_layout=kv_layout,

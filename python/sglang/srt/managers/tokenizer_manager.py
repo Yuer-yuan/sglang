@@ -77,6 +77,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GenerateReqInput,
+    GetUMAKVSnapshotReq,
     GetUMAWeightSnapshotReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -85,6 +86,8 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    KVResidencyReqOutput,
+    KVResidencySnapshotOutput,
     EvictWeightGroupReq,
     LoadWeightGroupReq,
     LoadLoRAAdapterReqInput,
@@ -92,6 +95,7 @@ from sglang.srt.managers.io_struct import (
     LoRAUpdateResult,
     OpenSessionReqInput,
     OpenSessionReqOutput,
+    OffloadKVRangeReq,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -101,6 +105,7 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    RestoreKVRangeReq,
     SessionParams,
     SetInternalStateReq,
     SetInternalStateReqOutput,
@@ -358,6 +363,9 @@ class TokenizerManager:
         self.uma_weight_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.uma_kv_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -435,6 +443,10 @@ class TokenizerManager:
                 (
                     UMAWeightReqOutput,
                     self.uma_weight_communicator.handle_recv,
+                ),
+                (
+                    (KVResidencyReqOutput, KVResidencySnapshotOutput),
+                    self.uma_kv_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -1054,6 +1066,37 @@ class TokenizerManager:
         if not results:
             raise RuntimeError("UMA weight request returned no scheduler result")
         failures = [result for result in results if not result.success]
+        return failures[0] if failures else results[0]
+
+    async def offload_uma_kv_range(
+        self, obj: OffloadKVRangeReq
+    ) -> KVResidencyReqOutput:
+        return await self._send_uma_kv_control(obj)
+
+    async def restore_uma_kv_range(
+        self, obj: RestoreKVRangeReq
+    ) -> KVResidencyReqOutput:
+        return await self._send_uma_kv_control(obj)
+
+    async def get_uma_kv_snapshot(self) -> KVResidencySnapshotOutput:
+        result = await self._send_uma_kv_control(
+            GetUMAKVSnapshotReq(f"kv-snapshot-{uuid.uuid4().hex}")
+        )
+        if not isinstance(result, KVResidencySnapshotOutput):
+            raise RuntimeError("UMA KV snapshot returned an operation result")
+        return result
+
+    async def _send_uma_kv_control(self, obj):
+        self.auto_create_handle_loop()
+        async with self.model_update_lock.writer_lock:
+            results = await self.uma_kv_communicator(obj)
+        if not results:
+            raise RuntimeError("UMA KV request returned no scheduler result")
+        failures = [
+            result
+            for result in results
+            if isinstance(result, KVResidencyReqOutput) and result.code != "OK"
+        ]
         return failures[0] if failures else results[0]
 
     async def init_weights_update_group(

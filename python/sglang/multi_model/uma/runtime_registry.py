@@ -66,6 +66,7 @@ class ManagedModelRuntime:
             self.instance_id,
             self.stage_id,
             self.resource_epoch,
+            self.checkpoint_digest,
             self.module,
             self.plan,
             sorted(self.ready_groups),
